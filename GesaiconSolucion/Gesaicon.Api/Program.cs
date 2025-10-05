@@ -3,6 +3,9 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using Serilog;
 using Microsoft.Extensions.FileProviders; // agregado
+using System.Threading.RateLimiting; // rate limiting
+using Microsoft.AspNetCore.RateLimiting; // extension AddRateLimiter
+using Gesaicon.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,6 +16,32 @@ Log.Logger = new LoggerConfiguration()
     .CreateLogger();
 
 builder.Host.UseSerilog();
+
+// Rate Limiting policy (10 req/min por IP para endpoints protegidos)
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddPolicy("receipt-analysis", context =>
+    {
+        var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
+        {
+            AutoReplenishment = true,
+            PermitLimit = 10,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+        });
+    });
+});
+
+// Prompt provider (lee archivo externo si existe)
+builder.Services.AddSingleton<IAnalysisPromptProvider>(sp =>
+{
+    var env = sp.GetRequiredService<IHostEnvironment>();
+    var config = sp.GetRequiredService<IConfiguration>();
+    var logger = sp.GetRequiredService<ILogger<AnalysisPromptProvider>>();
+    return new AnalysisPromptProvider(env.ContentRootPath, config, logger);
+});
 
 // Services
 builder.Services.AddControllers();
@@ -37,7 +66,6 @@ builder.Services.AddDbContext<GesaiconDbContext>((sp, options) =>
     {
         options.EnableSensitiveDataLogging();
     }
-    // Logging de EF Core a Serilog
     options.LogTo(message => Serilog.Log.ForContext("EFCore", true).Information(message),
                   Microsoft.Extensions.Logging.LogLevel.Information);
 });
@@ -45,17 +73,20 @@ builder.Services.AddDbContext<GesaiconDbContext>((sp, options) =>
 // HttpClient
 builder.Services.AddHttpClient();
 
+// Background queue & scheduled batch
+builder.Services.AddSingleton<ReceiptAnalysisQueueService>();
+builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>());
+builder.Services.AddSingleton<IReceiptAnalysisQueue>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>());
+
+builder.Services.AddHostedService<ScheduledBatchAnalysisService>();
+
 var app = builder.Build();
 
-app.UseSerilogRequestLogging(); // middleware de request logging
+app.UseSerilogRequestLogging();
 
-// Middleware global de excepciones para capturar errores que rompen swagger
 app.Use(async (context, next) =>
 {
-    try
-    {
-        await next();
-    }
+    try { await next(); }
     catch (Exception ex)
     {
         Log.Error(ex, "Excepción no controlada en la request {Path}", context.Request.Path);
@@ -64,7 +95,8 @@ app.Use(async (context, next) =>
     }
 });
 
-// Servir carpeta Uploads como archivos estáticos
+app.UseRateLimiter();
+
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, "Uploads");
 if (!Directory.Exists(uploadsPath)) Directory.CreateDirectory(uploadsPath);
 app.UseStaticFiles(new StaticFileOptions
@@ -73,17 +105,17 @@ app.UseStaticFiles(new StaticFileOptions
     RequestPath = "/Uploads"
 });
 
-// Swagger siempre habilitado
 app.UseSwagger();
 app.UseSwaggerUI(c =>
 {
     c.SwaggerEndpoint("/swagger/v1/swagger.json", "Gesaicon API v1");
-    c.RoutePrefix = "swagger"; // URL: /swagger
+    c.RoutePrefix = "swagger";
 });
 
 app.UseHttpsRedirection();
 app.UseAuthorization();
-app.MapControllers();
+
+app.MapControllers().RequireRateLimiting("receipt-analysis");
 
 try
 {
