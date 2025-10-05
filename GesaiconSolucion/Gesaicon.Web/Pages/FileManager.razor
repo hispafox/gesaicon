@@ -1,0 +1,251 @@
+@page "/files"
+@using Gesaicon.Web.Models
+@inject HttpClient Http
+
+<h3>Gestor de Archivos</h3>
+
+<div class="mb-3 d-flex gap-2 flex-wrap">
+    <input class="form-control" style="max-width:260px" placeholder="Buscar..."
+           @bind="_search" @bind:event="oninput" />
+    <select class="form-select" style="max-width:140px" @bind="_statusFilter">
+        <option value="">(Estado)</option>
+        <option>Processing</option>
+        <option>Completed</option>
+        <option>Error</option>
+    </select>
+    <select class="form-select" style="max-width:120px" @bind="_pageSize">
+        <option value="20">20</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+    </select>
+    <button class="btn btn-primary" @onclick="LoadAsync">Recargar</button>
+</div>
+
+@if (_loading)
+{
+    <p>Cargando...</p>
+}
+else if (_error != null)
+{
+    <div class="alert alert-danger">@_error</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+            <thead>
+                <tr>
+                    <th>Id</th>
+                    <th>Archivo</th>
+                    <th>Empresa</th>
+                    <th>Categoría</th>
+                    <th class="text-end">Importe</th>
+                    <th>Estado</th>
+                    <th>Subido</th>
+                    <th>Acciones</th>
+                </tr>
+            </thead>
+            <tbody>
+            @foreach (var t in _tickets)
+            {
+                var rowClass = t.Status switch
+                {
+                    "Completed" => "table-success",
+                    "Error" => "table-danger",
+                    "Processing" => "table-warning",
+                    _ => ""
+                };
+                <tr class="@rowClass" @onclick="(() => Select(t))" style="cursor:pointer">
+                    <td>@t.Id</td>
+                    <td>@t.FileName</td>
+                    <td>@t.CompanyName</td>
+                    <td>@t.Category</td>
+                    <td class="text-end">@((t.Amount)?.ToString("0.00"))</td>
+                    <td>@t.Status</td>
+                    <td>@t.UploadedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
+                    <td class="d-flex gap-1">
+                        @if (!string.IsNullOrWhiteSpace(t.FileUrl))
+                        {
+                            <a class="btn btn-sm btn-outline-secondary" href="@Absolute(t.FileUrl)" target="_blank" @onclick:stopPropagation>Ver</a>
+                        }
+                        @if (!string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
+                        {
+                            <button class="btn btn-sm btn-outline-info" @onclick:stopPropagation @onclick="(() => ShowAnalysis(t))">Análisis</button>
+                        }
+                    </td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+
+    <div class="d-flex justify-content-between align-items-center mt-2">
+        <div>Total: @_total</div>
+        <div class="btn-group">
+            <button class="btn btn-sm btn-outline-secondary" disabled="@(_page==0)" @onclick="PrevPage">«</button>
+            <span class="btn btn-sm btn-outline-secondary disabled">@(_page+1)</span>
+            <button class="btn btn-sm btn-outline-secondary" disabled="@((_page+1)*_pageSize >= _total)" @onclick="NextPage">»</button>
+        </div>
+    </div>
+
+    @if (_selected != null)
+    {
+        <hr />
+        <h5>Detalle Ticket #@_selected.Id</h5>
+        <div class="row">
+            <div class="col-md-6">
+                <dl class="row">
+                    <dt class="col-4">PublicId</dt><dd class="col-8">@_selected.PublicId</dd>
+                    <dt class="col-4">Archivo</dt><dd class="col-8">@_selected.FileName (@_selected.FileSizeBytes bytes)</dd>
+                    <dt class="col-4">Estado</dt><dd class="col-8">@_selected.Status</dd>
+                    <dt class="col-4">Importe</dt><dd class="col-8">@_selected.Amount</dd>
+                    <dt class="col-4">Empresa</dt><dd class="col-8">@_selected.CompanyName</dd>
+                    <dt class="col-4">Categoría</dt><dd class="col-8">@_selected.Category</dd>
+                    <dt class="col-4">Subido</dt><dd class="col-8">@_selected.UploadedAt.ToLocalTime()</dd>
+                </dl>
+                @if (!string.IsNullOrEmpty(_analysisError))
+                {
+                    <div class="alert alert-warning py-1">@_analysisError</div>
+                }
+                @if (_analysisLoading)
+                {
+                    <div>Cargando análisis...</div>
+                }
+                else if (!string.IsNullOrWhiteSpace(_analysisHtml))
+                {
+                    <div class="border rounded p-2" style="max-height:400px; overflow:auto">
+                        @((MarkupString)_analysisHtml)
+                    </div>
+                }
+            </div>
+            <div class="col-md-6">
+                @if (!string.IsNullOrWhiteSpace(_selected.FileUrl))
+                {
+                    <img src="@Absolute(_selected.FileUrl!)" class="img-fluid border" />
+                }
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private List<ExpenseTicketDto> _tickets = new();
+    private ExpenseTicketDto? _selected;
+    private int _total;
+    private int _page = 0;
+    private int _pageSize = 50;
+    private string? _statusFilter;
+    private string _search = "";
+    private bool _loading;
+    private string? _error;
+
+    private bool _analysisLoading;
+    private string? _analysisHtml;
+    private string? _analysisError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _error = null;
+        _loading = true;
+        StateHasChanged();
+        try
+        {
+            var qs = $"api/tickets?skip={_page * _pageSize}&take={_pageSize}";
+            if (!string.IsNullOrWhiteSpace(_statusFilter))
+                qs += $"&status={Uri.EscapeDataString(_statusFilter)}";
+            if (!string.IsNullOrWhiteSpace(_search))
+                qs += $"&search={Uri.EscapeDataString(_search)}";
+
+            var result = await Http.GetFromJsonAsync<PagedResult<ExpenseTicketDto>>(qs);
+            _tickets = result?.Items ?? new();
+            _total = result?.Total ?? 0;
+            if (_tickets.Count == 0) _selected = null;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    private void Select(ExpenseTicketDto t)
+    {
+        _selected = t;
+        _analysisHtml = null;
+        _analysisError = null;
+    }
+
+    private async Task NextPage()
+    {
+        if (((_page + 1) * _pageSize) >= _total) return;
+        _page++;
+        await LoadAsync();
+    }
+
+    private async Task PrevPage()
+    {
+        if (_page == 0) return;
+        _page--;
+        await LoadAsync();
+    }
+
+    private string Absolute(string rel)
+    {
+        if (string.IsNullOrWhiteSpace(rel)) return "#";
+        var baseUri = Http.BaseAddress?.ToString() ?? "/";
+        return rel.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? rel : baseUri.TrimEnd('/') + rel;
+    }
+
+    private async Task ShowAnalysis(ExpenseTicketDto ticket)
+    {
+        Select(ticket);
+        _analysisLoading = true;
+        _analysisError = null;
+        _analysisHtml = null;
+        try
+        {
+            var md = await Http.GetStringAsync($"api/tickets/{ticket.Id}/analysis");
+            _analysisHtml = SimpleMarkdown(md);
+        }
+        catch (HttpRequestException)
+        {
+            _analysisError = "No hay análisis disponible";
+        }
+        catch (Exception ex)
+        {
+            _analysisError = ex.Message;
+        }
+        finally
+        {
+            _analysisLoading = false;
+        }
+    }
+
+    // Conversión markdown MUY básica para mostrar (puedes sustituir por Markdig si agregas paquete)
+    private string SimpleMarkdown(string md)
+    {
+        if (string.IsNullOrWhiteSpace(md)) return string.Empty;
+        var html = md;
+        html = System.Net.WebUtility.HtmlEncode(html);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"^###### (.*)$", "<h6>$1</h6>", System.Text.RegularExpressions.RegexOptions.Multiline);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"^##### (.*)$", "<h5>$1</h5>", System.Text.RegularExpressions.RegexOptions.Multiline);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"^#### (.*)$", "<h4>$1</h4>", System.Text.RegularExpressions.RegexOptions.Multiline);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"^### (.*)$", "<h3>$1</h3>", System.Text.RegularExpressions.RegexOptions.Multiline);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"^## (.*)$", "<h2>$1</h2>", System.Text.RegularExpressions.RegexOptions.Multiline);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"^# (.*)$", "<h1>$1</h1>", System.Text.RegularExpressions.RegexOptions.Multiline);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"\*\*(.+?)\*\*", "<strong>$1</strong>");
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"\*(.+?)\*", "<em>$1</em>");
+        html = html.Replace("\r", "");
+        html = string.Join("", html.Split('\n').Select(l => l.StartsWith("<h") ? l : ($"<p>{l}</p>")));
+        return html;
+    }
+}

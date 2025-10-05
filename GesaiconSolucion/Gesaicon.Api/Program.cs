@@ -34,6 +34,18 @@ builder.Services.AddRateLimiter(options =>
     });
 });
 
+// CORS para permitir Blazor WASM (puertos reales según launchSettings)
+builder.Services.AddCors(opt =>
+{
+    opt.AddPolicy("AllowBlazor", p => p
+        .WithOrigins(
+            "https://localhost:7110",
+            "http://localhost:5259"
+        )
+        .AllowAnyHeader()
+        .AllowAnyMethod());
+});
+
 // Prompt provider (lee archivo externo si existe)
 builder.Services.AddSingleton<IAnalysisPromptProvider>(sp =>
 {
@@ -96,6 +108,9 @@ app.Use(async (context, next) =>
 });
 
 app.UseRateLimiter();
+
+// CORS antes de auth
+app.UseCors("AllowBlazor");
 
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, "Uploads");
 if (!Directory.Exists(uploadsPath)) Directory.CreateDirectory(uploadsPath);
