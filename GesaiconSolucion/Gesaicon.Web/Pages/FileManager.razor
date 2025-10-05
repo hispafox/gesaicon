@@ -15,7 +15,7 @@
     </select>
     <select class="form-select" style="max-width:120px" @bind="_pageSize">
         <option value="20">20</option>
-        <option value="50">50</option>
+        <option value="50" selected>50</option>
         <option value="100">100</option>
     </select>
     <button class="btn btn-primary" @onclick="LoadAsync">Recargar</button>
@@ -55,7 +55,7 @@ else
                     "Processing" => "table-warning",
                     _ => ""
                 };
-                <tr class="@rowClass" @onclick="(() => Select(t))" style="cursor:pointer">
+                <tr class="@rowClass" @onclick="(() => RowClicked(t))" style="cursor:pointer">
                     <td>@t.Id</td>
                     <td>@t.FileName</td>
                     <td>@t.CompanyName</td>
@@ -68,9 +68,9 @@ else
                         {
                             <a class="btn btn-sm btn-outline-secondary" href="@Absolute(t.FileUrl)" target="_blank" @onclick:stopPropagation>Ver</a>
                         }
-                        @if (!string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
+                        @if (t.Status == "Completed" && !string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
                         {
-                            <button class="btn btn-sm btn-outline-info" @onclick:stopPropagation @onclick="(() => ShowAnalysis(t))">Análisis</button>
+                            <span class="badge text-bg-info" title="Análisis disponible">MD</span>
                         }
                     </td>
                 </tr>
@@ -105,7 +105,7 @@ else
                 </dl>
                 @if (!string.IsNullOrEmpty(_analysisError))
                 {
-                    <div class="alert alert-warning py-1">@_analysisError</div>
+                    <div class="alert alert-warning py-1 mb-2">@_analysisError</div>
                 }
                 @if (_analysisLoading)
                 {
@@ -164,7 +164,24 @@ else
             var result = await Http.GetFromJsonAsync<PagedResult<ExpenseTicketDto>>(qs);
             _tickets = result?.Items ?? new();
             _total = result?.Total ?? 0;
-            if (_tickets.Count == 0) _selected = null;
+            if (_tickets.Count == 0)
+            {
+                _selected = null;
+            }
+            else
+            {
+                // Seleccionar el primer ticket si no hay seleccionado
+                if (_selected == null || !_tickets.Any(t => t.Id == _selected.Id))
+                {
+                    _selected = _tickets.First();
+                    _analysisHtml = null;
+                    _analysisError = null;
+                    if (_selected.Status == "Completed" && !string.IsNullOrWhiteSpace(_selected.AnalysisFileUrl))
+                    {
+                        await FetchAnalysis(_selected);
+                    }
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -177,11 +194,45 @@ else
         }
     }
 
-    private void Select(ExpenseTicketDto t)
+    private async Task RowClicked(ExpenseTicketDto t)
     {
         _selected = t;
         _analysisHtml = null;
         _analysisError = null;
+        if (t.Status == "Completed" && !string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
+        {
+            await FetchAnalysis(t);
+        }
+        else
+        {
+            StateHasChanged();
+        }
+    }
+
+    private async Task FetchAnalysis(ExpenseTicketDto ticket)
+    {
+        _analysisLoading = true;
+        _analysisError = null;
+        _analysisHtml = null;
+        StateHasChanged();
+        try
+        {
+            var md = await Http.GetStringAsync($"api/tickets/{ticket.Id}/analysis");
+            _analysisHtml = SimpleMarkdown(md);
+        }
+        catch (HttpRequestException)
+        {
+            _analysisError = "No hay análisis disponible";
+        }
+        catch (Exception ex)
+        {
+            _analysisError = ex.Message;
+        }
+        finally
+        {
+            _analysisLoading = false;
+            StateHasChanged();
+        }
     }
 
     private async Task NextPage()
@@ -205,32 +256,6 @@ else
         return rel.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? rel : baseUri.TrimEnd('/') + rel;
     }
 
-    private async Task ShowAnalysis(ExpenseTicketDto ticket)
-    {
-        Select(ticket);
-        _analysisLoading = true;
-        _analysisError = null;
-        _analysisHtml = null;
-        try
-        {
-            var md = await Http.GetStringAsync($"api/tickets/{ticket.Id}/analysis");
-            _analysisHtml = SimpleMarkdown(md);
-        }
-        catch (HttpRequestException)
-        {
-            _analysisError = "No hay análisis disponible";
-        }
-        catch (Exception ex)
-        {
-            _analysisError = ex.Message;
-        }
-        finally
-        {
-            _analysisLoading = false;
-        }
-    }
-
-    // Conversión markdown MUY básica para mostrar (puedes sustituir por Markdig si agregas paquete)
     private string SimpleMarkdown(string md)
     {
         if (string.IsNullOrWhiteSpace(md)) return string.Empty;
