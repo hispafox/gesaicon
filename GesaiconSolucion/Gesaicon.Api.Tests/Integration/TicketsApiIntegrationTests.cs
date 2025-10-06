@@ -8,56 +8,54 @@ using Gesaicon.Api.Data;
 using Gesaicon.Api.Models;
 using Microsoft.EntityFrameworkCore;
 using static Gesaicon.Api.Controllers.TicketsController;
+using Gesaicon.Api.Services;
+using Microsoft.Extensions.Hosting;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Moq;
 
 namespace Gesaicon.Api.Tests.Integration
 {
-    public class TicketsApiIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
+    public class CustomWebApplicationFactory : WebApplicationFactory<Program>
     {
-        private readonly WebApplicationFactory<Program> _factory;
-        private readonly HttpClient _client;
-
-        public TicketsApiIntegrationTests(WebApplicationFactory<Program> factory)
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
-            _factory = factory.WithWebHostBuilder(builder =>
+            builder.UseEnvironment("Testing");
+
+            builder.ConfigureServices(services =>
             {
-                builder.ConfigureServices(services =>
+                // Remover ReceiptAnalysisQueueService que también es un IHostedService
+                services.RemoveAll(typeof(ReceiptAnalysisQueueService));
+                
+                // Remover servicios de fondo que causan conflictos
+                var hostedServicesToRemove = services
+                    .Where(d => d.ServiceType == typeof(IHostedService))
+                    .ToList();
+
+                foreach (var descriptor in hostedServicesToRemove)
                 {
-                    // Remover el DbContext existente
-                    var descriptor = services.SingleOrDefault(
-                        d => d.ServiceType == typeof(DbContextOptions<GesaiconDbContext>));
+                    services.Remove(descriptor);
+                }
 
-                    if (descriptor != null)
-                    {
-                        services.Remove(descriptor);
-                    }
-
-                    // Remover también el DbContext registrado
-                    var dbContextDescriptor = services.SingleOrDefault(
-                        d => d.ServiceType == typeof(GesaiconDbContext));
-
-                    if (dbContextDescriptor != null)
-                    {
-                        services.Remove(dbContextDescriptor);
-                    }
-
-                    // Agregar DbContext con InMemory database
-                    services.AddDbContext<GesaiconDbContext>(options =>
-                    {
-                        options.UseInMemoryDatabase("TestDb_" + Guid.NewGuid());
-                    });
+                // Agregar un mock de IReceiptAnalysisQueue para que los controladores no fallen
+                services.AddSingleton<IReceiptAnalysisQueue>(sp =>
+                {
+                    var mock = new Mock<IReceiptAnalysisQueue>();
+                    mock.Setup(m => m.EnqueueAsync(It.IsAny<int>(), It.IsAny<int>()))
+                        .Returns(ValueTask.CompletedTask);
+                    return mock.Object;
                 });
             });
-
-            _client = _factory.CreateClient();
-            
-            // Seed test data después de crear el cliente
-            using var scope = _factory.Services.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<GesaiconDbContext>();
-            SeedTestData(db);
         }
 
-        private static void SeedTestData(GesaiconDbContext context)
+        public void SeedDatabase()
         {
+            using var scope = Services.CreateScope();
+            var context = scope.ServiceProvider.GetRequiredService<GesaiconDbContext>();
+
+            // Asegurar que la base de datos esté creada
+            context.Database.EnsureCreated();
+
             var tickets = new[]
             {
                 new ExpenseTicket
@@ -85,6 +83,21 @@ namespace Gesaicon.Api.Tests.Integration
 
             context.ExpenseTickets.AddRange(tickets);
             context.SaveChanges();
+        }
+    }
+
+    public class TicketsApiIntegrationTests : IClassFixture<CustomWebApplicationFactory>
+    {
+        private readonly CustomWebApplicationFactory _factory;
+        private readonly HttpClient _client;
+
+        public TicketsApiIntegrationTests(CustomWebApplicationFactory factory)
+        {
+            _factory = factory;
+            _client = _factory.CreateClient();
+            
+            // Seedear datos después de que el servidor esté completamente iniciado
+            _factory.SeedDatabase();
         }
 
         [Fact]
@@ -139,6 +152,10 @@ namespace Gesaicon.Api.Tests.Integration
         {
             // Act
             var response = await _client.GetAsync("/api/tickets?search=Test Store");
+            
+            // Asegurar que la respuesta es exitosa
+            response.EnsureSuccessStatusCode();
+            
             var result = await response.Content.ReadFromJsonAsync<PagedResult<ExpenseTicketDto>>();
 
             // Assert

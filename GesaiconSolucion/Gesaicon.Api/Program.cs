@@ -76,17 +76,28 @@ builder.Services.AddSwaggerGen(c =>
 });
 
 // DbContext
-builder.Services.AddDbContext<GesaiconDbContext>((sp, options) =>
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+var useSqlServer = !string.IsNullOrEmpty(connectionString) && 
+                   builder.Environment.EnvironmentName != "Testing";
+
+builder.Services.AddDbContext<GesaiconDbContext>(options =>
 {
-    var env = sp.GetRequiredService<IHostEnvironment>();
-    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"));
-    options.EnableDetailedErrors();
-    if (env.IsDevelopment())
+    if (useSqlServer)
     {
-        options.EnableSensitiveDataLogging();
+        options.UseSqlServer(connectionString);
+        options.EnableDetailedErrors();
+        if (builder.Environment.IsDevelopment())
+        {
+            options.EnableSensitiveDataLogging();
+        }
+        options.LogTo(message => Serilog.Log.ForContext("EFCore", true).Information(message),
+                      Microsoft.Extensions.Logging.LogLevel.Information);
     }
-    options.LogTo(message => Serilog.Log.ForContext("EFCore", true).Information(message),
-                  Microsoft.Extensions.Logging.LogLevel.Information);
+    else
+    {
+        // Use InMemory database for testing
+        options.UseInMemoryDatabase("TestDb");
+    }
 });
 
 // HttpClient
@@ -124,7 +135,11 @@ app.Use(async (context, next) =>
 // MOVER CORS ANTES DEL RATE LIMITER
 app.UseCors("AllowBlazor");
 
-app.UseRateLimiter();
+// No aplicar rate limiter en ambiente de Testing
+if (!app.Environment.EnvironmentName.Equals("Testing", StringComparison.OrdinalIgnoreCase))
+{
+    app.UseRateLimiter();
+}
 
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, "Uploads");
 if (!Directory.Exists(uploadsPath)) Directory.CreateDirectory(uploadsPath);
