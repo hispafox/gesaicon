@@ -4,7 +4,7 @@
 
 <h3>Gestor de Archivos</h3>
 
-<div class="mb-3 d-flex gap-2 flex-wrap">
+<div class="mb-3 d-flex gap-2 flex-wrap align-items-start">
     <input class="form-control" style="max-width:260px" placeholder="Buscar..."
            @bind="_search" @bind:event="oninput" />
     <select class="form-select" style="max-width:140px" @bind="_statusFilter">
@@ -18,7 +18,7 @@
         <option value="50" selected>50</option>
         <option value="100">100</option>
     </select>
-    <button class="btn btn-primary" @onclick="LoadAsync">Recargar</button>
+    <button class="btn btn-primary" @onclick="LoadAsync" disabled="@_loading">Recargar</button>
 </div>
 
 @if (_loading)
@@ -170,7 +170,6 @@ else
             }
             else
             {
-                // Seleccionar el primer ticket si no hay seleccionado
                 if (_selected == null || !_tickets.Any(t => t.Id == _selected.Id))
                 {
                     _selected = _tickets.First();

@@ -22,6 +22,11 @@ builder.Services.AddRateLimiter(options =>
 {
     options.AddPolicy("receipt-analysis", context =>
     {
+        // No limitar preflight OPTIONS para evitar romper CORS
+        if (HttpMethods.IsOptions(context.Request.Method))
+        {
+            return RateLimitPartition.GetNoLimiter("preflight");
+        }
         var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
         {
@@ -43,7 +48,9 @@ builder.Services.AddCors(opt =>
             "http://localhost:5259"
         )
         .AllowAnyHeader()
-        .AllowAnyMethod());
+        .AllowAnyMethod()
+        .SetPreflightMaxAge(TimeSpan.FromMinutes(10))
+    );
 });
 
 // Prompt provider (lee archivo externo si existe)
@@ -107,10 +114,10 @@ app.Use(async (context, next) =>
     }
 });
 
-app.UseRateLimiter();
-
-// CORS antes de auth
+// MOVER CORS ANTES DEL RATE LIMITER
 app.UseCors("AllowBlazor");
+
+app.UseRateLimiter();
 
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, "Uploads");
 if (!Directory.Exists(uploadsPath)) Directory.CreateDirectory(uploadsPath);

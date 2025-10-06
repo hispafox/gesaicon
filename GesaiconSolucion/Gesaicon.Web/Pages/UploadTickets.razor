@@ -1,0 +1,89 @@
+@page "/upload"
+@using Microsoft.AspNetCore.Components.Forms
+@inject HttpClient Http
+
+<h3>Subir Tickets</h3>
+<p class="text-muted">Selecciona imágenes de tickets (JPG, PNG, WEBP, GIF) máximo 5MB cada una.</p>
+
+<div class="mb-3">
+    <InputFile OnChange="OnFilesSelected" multiple accept=".jpg,.jpeg,.png,.gif,.webp,image/*" />
+</div>
+
+@if (_uploading)
+{
+    <div class="alert alert-info py-1">Subiendo (@_currentIndex / @_totalFiles)...</div>
+}
+@if (!string.IsNullOrWhiteSpace(_resultInfo))
+{
+    <div class="alert alert-success py-1">@_resultInfo</div>
+}
+@if (!string.IsNullOrWhiteSpace(_error))
+{
+    <div class="alert alert-danger py-1">@_error</div>
+}
+
+@if (_details.Any())
+{
+    <h5>Resultados</h5>
+    <ul class="list-group mb-3">
+        @foreach (var d in _details)
+        {
+            <li class="list-group-item small d-flex justify-content-between">
+                <span>@d.FileName</span>
+                <span class="@(d.Status == "OK" ? "text-success" : d.Status=="DUP" ? "text-warning" : "text-danger")">@d.Status</span>
+            </li>
+        }
+    </ul>
+}
+
+<a class="btn btn-secondary" href="/files">Volver al listado</a>
+
+@code {
+    private bool _uploading;
+    private string? _error;
+    private string? _resultInfo;
+    private int _totalFiles;
+    private int _currentIndex;
+
+    private record UploadDetail(string FileName, string Status);
+    private List<UploadDetail> _details = new();
+
+    private async Task OnFilesSelected(InputFileChangeEventArgs e)
+    {
+        var files = e.GetMultipleFiles();
+        if (files == null || files.Count == 0) return;
+        _uploading = true; _error = null; _resultInfo = null; _details.Clear(); StateHasChanged();
+        _totalFiles = files.Count; _currentIndex = 0;
+        int ok=0, dup=0, fail=0;
+        foreach (var file in files)
+        {
+            _currentIndex++;
+            try
+            {
+                if (file.Size > 5 * 1024 * 1024)
+                {
+                    fail++; _details.Add(new UploadDetail(file.Name, ">5MB")); continue;
+                }
+                using var content = new MultipartFormDataContent();
+                using var stream = file.OpenReadStream(5 * 1024 * 1024);
+                var sc = new StreamContent(stream);
+                content.Add(sc, "File", file.Name);
+                var resp = await Http.PostAsync("api/ExpenseTickets/upload", content);
+                var body = await resp.Content.ReadAsStringAsync();
+                if (resp.IsSuccessStatusCode)
+                {
+                    if (body.Contains("duplicateOf")) { dup++; _details.Add(new UploadDetail(file.Name, "DUP")); }
+                    else { ok++; _details.Add(new UploadDetail(file.Name, "OK")); }
+                }
+                else { fail++; _details.Add(new UploadDetail(file.Name, resp.StatusCode.ToString())); }
+            }
+            catch (Exception ex)
+            {
+                fail++; _details.Add(new UploadDetail(file.Name, ex.GetType().Name));
+            }
+            StateHasChanged();
+        }
+        _uploading = false;
+        _resultInfo = $"Completado. Nuevos: {ok}, Duplicados: {dup}, Errores: {fail}";
+    }
+}
