@@ -2,7 +2,51 @@
 @using Gesaicon.Web.Models
 @inject HttpClient Http
 
-<h3>Gestor de Archivos</h3>
+<style>
+    .status-badge {
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.25rem;
+        font-size: 0.875rem;
+        font-weight: 500;
+    }
+    .status-completed { background-color: #d1e7dd; color: #0f5132; }
+    .status-error { background-color: #f8d7da; color: #842029; }
+    .status-processing { background-color: #fff3cd; color: #664d03; }
+    .status-pending { background-color: #cfe2ff; color: #084298; }
+    
+    .btn-action {
+        min-width: 38px;
+        height: 38px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    .table-hover tbody tr:hover {
+        background-color: rgba(13, 110, 253, 0.05);
+    }
+
+    /* Modal personalizado */
+    .modal-xl-custom {
+        max-width: 95%;
+        width: 1400px;
+    }
+
+    .modal-body-scroll {
+        max-height: calc(100vh - 200px);
+        overflow-y: auto;
+    }
+
+    .ticket-image {
+        max-height: 600px;
+        width: 100%;
+        object-fit: contain;
+        background-color: #f8f9fa;
+        border-radius: 0.375rem;
+    }
+</style>
+
+<h3 class="mb-4">Gestor de Archivos</h3>
 
 <div class="mb-3 d-flex gap-2 flex-wrap align-items-start">
     <input class="form-control" style="max-width:260px" placeholder="Buscar..."
@@ -18,12 +62,19 @@
         <option value="50" selected>50</option>
         <option value="100">100</option>
     </select>
-    <button class="btn btn-primary" @onclick="LoadAsync" disabled="@_loading">Recargar</button>
+    <button class="btn btn-primary" @onclick="LoadAsync" disabled="@_loading">
+        @if(_loading) { <span class="spinner-border spinner-border-sm me-1"></span> }
+        Recargar
+    </button>
 </div>
 
 @if (_loading)
 {
-    <p>Cargando...</p>
+    <div class="text-center py-5">
+        <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Cargando...</span>
+        </div>
+    </div>
 }
 else if (_error != null)
 {
@@ -31,106 +82,241 @@ else if (_error != null)
 }
 else
 {
-    <div class="table-responsive">
-        <table class="table table-sm table-hover align-middle">
-            <thead>
-                <tr>
-                    <th>Id</th>
-                    <th>Archivo</th>
-                    <th>Empresa</th>
-                    <th>Categoría</th>
-                    <th class="text-end">Importe</th>
-                    <th>Estado</th>
-                    <th>Subido</th>
-                    <th>Acciones</th>
-                </tr>
-            </thead>
-            <tbody>
-            @foreach (var t in _tickets)
-            {
-                var rowClass = t.Status switch
-                {
-                    "Completed" => "table-success",
-                    "Error" => "table-danger",
-                    "Processing" => "table-warning",
-                    _ => ""
-                };
-                <tr class="@rowClass" @onclick="(() => RowClicked(t))" style="cursor:pointer">
-                    <td>@t.Id</td>
-                    <td>@t.FileName</td>
-                    <td>@t.CompanyName</td>
-                    <td>@t.Category</td>
-                    <td class="text-end">@((t.Amount)?.ToString("0.00"))</td>
-                    <td>@t.Status</td>
-                    <td>@t.UploadedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
-                    <td class="d-flex gap-1">
-                        @if (!string.IsNullOrWhiteSpace(t.FileUrl))
-                        {
-                            <a class="btn btn-sm btn-outline-secondary" href="@Absolute(t.FileUrl)" target="_blank" @onclick:stopPropagation>Ver</a>
-                        }
-                        @if (t.Status == "Completed" && !string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
-                        {
-                            <span class="badge text-bg-info" title="Análisis disponible">MD</span>
-                        }
-                    </td>
-                </tr>
-            }
-            </tbody>
-        </table>
-    </div>
-
-    <div class="d-flex justify-content-between align-items-center mt-2">
-        <div>Total: @_total</div>
-        <div class="btn-group">
-            <button class="btn btn-sm btn-outline-secondary" disabled="@(_page==0)" @onclick="PrevPage">«</button>
-            <span class="btn btn-sm btn-outline-secondary disabled">@(_page+1)</span>
-            <button class="btn btn-sm btn-outline-secondary" disabled="@((_page+1)*_pageSize >= _total)" @onclick="NextPage">»</button>
+    <div class="card shadow-sm">
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th class="px-3">Id</th>
+                            <th>Archivo</th>
+                            <th>Empresa</th>
+                            <th>Categoría</th>
+                            <th class="text-end">Importe</th>
+                            <th>Estado</th>
+                            <th>Subido</th>
+                            <th class="text-center">Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var t in _tickets)
+                    {
+                        <tr @onclick="(() => OpenModal(t))" style="cursor:pointer">
+                            <td class="px-3">@t.Id</td>
+                            <td>@t.FileName</td>
+                            <td>@t.CompanyName</td>
+                            <td>@t.Category</td>
+                            <td class="text-end">@((t.Amount)?.ToString("0.00"))</td>
+                            <td>
+                                <span class="status-badge @GetStatusClass(t.Status)">
+                                    @t.Status
+                                </span>
+                            </td>
+                            <td>@t.UploadedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
+                            <td>
+                                <div class="d-flex gap-1 justify-content-center">
+                                    @if (!string.IsNullOrWhiteSpace(t.FileUrl))
+                                    {
+                                        <a class="btn btn-sm btn-outline-secondary btn-action" href="@Absolute(t.FileUrl)" target="_blank" @onclick:stopPropagation title="Ver imagen">
+                                            <i class="bi bi-eye"></i>
+                                        </a>
+                                    }
+                                    @if (t.Status == "Completed" && !string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
+                                    {
+                                        <button class="btn btn-sm btn-outline-info btn-action" title="Ver análisis" @onclick="(e => OpenModal(t))" @onclick:stopPropagation>
+                                            <i class="bi bi-file-earmark-text"></i>
+                                        </button>
+                                    }
+                                    <button class="btn btn-sm btn-outline-primary btn-action" title="Reprocesar" disabled="@(_reprocessingIds.Contains(t.Id))" @onclick="(e=> Reprocess(t, e, false))" @onclick:stopPropagation>
+                                        @if(_reprocessingIds.Contains(t.Id)) { 
+                                            <span class="spinner-border spinner-border-sm"></span> 
+                                        } else { 
+                                            <i class="bi bi-arrow-clockwise"></i> 
+                                        }
+                                    </button>
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 
-    @if (_selected != null)
-    {
-        <hr />
-        <h5>Detalle Ticket #@_selected.Id</h5>
-        <div class="row">
-            <div class="col-md-6">
-                <dl class="row">
-                    <dt class="col-4">PublicId</dt><dd class="col-8">@_selected.PublicId</dd>
-                    <dt class="col-4">Archivo</dt><dd class="col-8">@_selected.FileName (@_selected.FileSizeBytes bytes)</dd>
-                    <dt class="col-4">Estado</dt><dd class="col-8">@_selected.Status</dd>
-                    <dt class="col-4">Importe</dt><dd class="col-8">@_selected.Amount</dd>
-                    <dt class="col-4">Empresa</dt><dd class="col-8">@_selected.CompanyName</dd>
-                    <dt class="col-4">Categoría</dt><dd class="col-8">@_selected.Category</dd>
-                    <dt class="col-4">Subido</dt><dd class="col-8">@_selected.UploadedAt.ToLocalTime()</dd>
-                </dl>
-                @if (!string.IsNullOrEmpty(_analysisError))
-                {
-                    <div class="alert alert-warning py-1 mb-2">@_analysisError</div>
-                }
-                @if (_analysisLoading)
-                {
-                    <div>Cargando análisis...</div>
-                }
-                else if (!string.IsNullOrWhiteSpace(_analysisHtml))
-                {
-                    <div class="border rounded p-2" style="max-height:400px; overflow:auto">
-                        @((MarkupString)_analysisHtml)
+    <div class="d-flex justify-content-between align-items-center mt-3">
+        <div class="text-muted">Total: <strong>@_total</strong> tickets</div>
+        <nav>
+            <ul class="pagination pagination-sm mb-0">
+                <li class="page-item @(_page==0 ? "disabled" : "")">
+                    <button class="page-link" @onclick="PrevPage" disabled="@(_page==0)">&laquo; Anterior</button>
+                </li>
+                <li class="page-item active">
+                    <span class="page-link">@(_page+1)</span>
+                </li>
+                <li class="page-item @((_page+1)*_pageSize >= _total ? "disabled" : "")">
+                    <button class="page-link" @onclick="NextPage" disabled="@((_page+1)*_pageSize >= _total)">Siguiente &raquo;</button>
+                </li>
+            </ul>
+        </nav>
+    </div>
+}
+
+<!-- Modal de Detalle -->
+@if (_showModal && _selected != null)
+{
+    <div class="modal fade show d-block" tabindex="-1" style="background-color: rgba(0,0,0,0.5);" @onclick="CloseModal">
+        <div class="modal-dialog modal-xl-custom" @onclick:stopPropagation>
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title">
+                        <i class="bi bi-receipt me-2"></i>
+                        Ticket #@_selected.Id - @_selected.FileName
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" @onclick="CloseModal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body modal-body-scroll">
+                    <!-- Acciones rápidas -->
+                    <div class="mb-3 d-flex gap-2 align-items-center">
+                        <span class="status-badge @GetStatusClass(_selected.Status)">@_selected.Status</span>
+                        <button class="btn btn-sm btn-primary" disabled="@_reprocessingIds.Contains(_selected.Id)" @onclick="(e=> Reprocess(_selected, e, false))">
+                            @if(_reprocessingIds.Contains(_selected.Id)) { 
+                                <span class="spinner-border spinner-border-sm me-1"></span> 
+                            } else { 
+                                <i class="bi bi-arrow-clockwise me-1"></i> 
+                            }
+                            Reprocesar
+                        </button>
+                        @if(_selected.Status == "Processing")
+                        {
+                            <button class="btn btn-sm btn-danger" disabled="@_reprocessingIds.Contains(_selected.Id)" @onclick="(e=> Reprocess(_selected, e, true))" title="Forzar reproceso si está atascado">
+                                @if(_reprocessingIds.Contains(_selected.Id)) { 
+                                    <span class="spinner-border spinner-border-sm me-1"></span> 
+                                } else { 
+                                    <i class="bi bi-exclamation-triangle me-1"></i> 
+                                }
+                                Forzar
+                            </button>
+                        }
+                        @if (!string.IsNullOrWhiteSpace(_selected.FileUrl))
+                        {
+                            <a class="btn btn-sm btn-outline-secondary" href="@Absolute(_selected.FileUrl)" target="_blank">
+                                <i class="bi bi-download me-1"></i>
+                                Descargar Original
+                            </a>
+                        }
                     </div>
-                }
-            </div>
-            <div class="col-md-6">
-                @if (!string.IsNullOrWhiteSpace(_selected.FileUrl))
-                {
-                    <img src="@Absolute(_selected.FileUrl!)" class="img-fluid border" />
-                }
+
+                    <div class="row">
+                        <!-- Columna Izquierda: Información -->
+                        <div class="col-lg-5">
+                            <div class="card mb-3">
+                                <div class="card-header bg-light">
+                                    <h6 class="mb-0"><i class="bi bi-info-circle me-2"></i>Información General</h6>
+                                </div>
+                                <div class="card-body">
+                                    <dl class="row mb-0">
+                                        <dt class="col-5 text-muted">PublicId</dt>
+                                        <dd class="col-7"><code class="small">@_selected.PublicId</code></dd>
+                                        
+                                        <dt class="col-5 text-muted">Archivo</dt>
+                                        <dd class="col-7">@_selected.FileName</dd>
+                                        
+                                        <dt class="col-5 text-muted">Tamaño</dt>
+                                        <dd class="col-7">@FormatFileSize(_selected.FileSizeBytes)</dd>
+                                        
+                                        <dt class="col-5 text-muted">Empresa</dt>
+                                        <dd class="col-7"><strong>@_selected.CompanyName</strong></dd>
+                                        
+                                        <dt class="col-5 text-muted">Categoría</dt>
+                                        <dd class="col-7"><span class="badge bg-secondary">@_selected.Category</span></dd>
+                                        
+                                        <dt class="col-5 text-muted">Importe</dt>
+                                        <dd class="col-7"><strong class="text-success fs-5">@_selected.Amount?.ToString("C")</strong></dd>
+                                        
+                                        <dt class="col-5 text-muted">Fecha de subida</dt>
+                                        <dd class="col-7">@_selected.UploadedAt.ToLocalTime().ToString("dd/MM/yyyy HH:mm:ss")</dd>
+                                    </dl>
+                                    
+                                    @if(_selected.Status == "Error" && !string.IsNullOrWhiteSpace(_selected.LastErrorMessage))
+                                    {
+                                        <div class="alert alert-danger py-2 mb-0 mt-2">
+                                            <i class="bi bi-exclamation-triangle me-1"></i>
+                                            <strong>Error:</strong> @_selected.LastErrorMessage
+                                        </div>
+                                    }
+                                </div>
+                            </div>
+
+                            <!-- Análisis -->
+                            @if (_selected.Status == "Completed" && !string.IsNullOrWhiteSpace(_selected.AnalysisFileUrl))
+                            {
+                                <div class="card">
+                                    <div class="card-header bg-light">
+                                        <h6 class="mb-0"><i class="bi bi-file-earmark-text me-2"></i>Análisis del Ticket</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        @if (!string.IsNullOrEmpty(_analysisError))
+                                        {
+                                            <div class="alert alert-warning py-2 mb-0">
+                                                <i class="bi bi-exclamation-circle me-1"></i>@_analysisError
+                                            </div>
+                                        }
+                                        else if (_analysisLoading)
+                                        {
+                                            <div class="text-center py-3">
+                                                <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+                                                <span>Cargando análisis...</span>
+                                            </div>
+                                        }
+                                        else if (!string.IsNullOrWhiteSpace(_analysisHtml))
+                                        {
+                                            <div class="border rounded p-3 bg-light" style="max-height:400px; overflow-y:auto">
+                                                @((MarkupString)_analysisHtml)
+                                            </div>
+                                        }
+                                    </div>
+                                </div>
+                            }
+                        </div>
+
+                        <!-- Columna Derecha: Imagen -->
+                        <div class="col-lg-7">
+                            @if (!string.IsNullOrWhiteSpace(_selected.FileUrl))
+                            {
+                                <div class="card">
+                                    <div class="card-header bg-light">
+                                        <h6 class="mb-0"><i class="bi bi-image me-2"></i>Vista Previa</h6>
+                                    </div>
+                                    <div class="card-body p-2 text-center">
+                                        <img src="@Absolute(_selected.FileUrl!)" class="ticket-image" alt="Ticket" />
+                                    </div>
+                                </div>
+                            }
+                            else
+                            {
+                                <div class="alert alert-info">
+                                    <i class="bi bi-info-circle me-2"></i>
+                                    No hay imagen disponible para este ticket.
+                                </div>
+                            }
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" @onclick="CloseModal">
+                        <i class="bi bi-x-lg me-1"></i>Cerrar
+                    </button>
+                </div>
             </div>
         </div>
-    }
+    </div>
 }
 
 @code {
     private List<ExpenseTicketDto> _tickets = new();
     private ExpenseTicketDto? _selected;
+    private bool _showModal = false;
     private int _total;
     private int _page = 0;
     private int _pageSize = 50;
@@ -143,9 +329,32 @@ else
     private string? _analysisHtml;
     private string? _analysisError;
 
+    private HashSet<int> _reprocessingIds = new();
+
     protected override async Task OnInitializedAsync()
     {
         await LoadAsync();
+    }
+
+    private string GetStatusClass(string status) => status switch
+    {
+        "Completed" => "status-completed",
+        "Error" => "status-error",
+        "Processing" => "status-processing",
+        _ => "status-pending"
+    };
+
+    private string FormatFileSize(long bytes)
+    {
+        string[] sizes = { "B", "KB", "MB", "GB" };
+        double len = bytes;
+        int order = 0;
+        while (len >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            len = len / 1024;
+        }
+        return $"{len:0.##} {sizes[order]}";
     }
 
     private async Task LoadAsync()
@@ -164,23 +373,6 @@ else
             var result = await Http.GetFromJsonAsync<PagedResult<ExpenseTicketDto>>(qs);
             _tickets = result?.Items ?? new();
             _total = result?.Total ?? 0;
-            if (_tickets.Count == 0)
-            {
-                _selected = null;
-            }
-            else
-            {
-                if (_selected == null || !_tickets.Any(t => t.Id == _selected.Id))
-                {
-                    _selected = _tickets.First();
-                    _analysisHtml = null;
-                    _analysisError = null;
-                    if (_selected.Status == "Completed" && !string.IsNullOrWhiteSpace(_selected.AnalysisFileUrl))
-                    {
-                        await FetchAnalysis(_selected);
-                    }
-                }
-            }
         }
         catch (Exception ex)
         {
@@ -193,19 +385,30 @@ else
         }
     }
 
-    private async Task RowClicked(ExpenseTicketDto t)
+    private async Task OpenModal(ExpenseTicketDto ticket)
     {
-        _selected = t;
+        _selected = ticket;
+        _showModal = true;
         _analysisHtml = null;
         _analysisError = null;
-        if (t.Status == "Completed" && !string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
+        
+        if (ticket.Status == "Completed" && !string.IsNullOrWhiteSpace(ticket.AnalysisFileUrl))
         {
-            await FetchAnalysis(t);
+            await FetchAnalysis(ticket);
         }
         else
         {
             StateHasChanged();
         }
+    }
+
+    private void CloseModal()
+    {
+        _showModal = false;
+        _selected = null;
+        _analysisHtml = null;
+        _analysisError = null;
+        StateHasChanged();
     }
 
     private async Task FetchAnalysis(ExpenseTicketDto ticket)
@@ -230,6 +433,43 @@ else
         finally
         {
             _analysisLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task Reprocess(ExpenseTicketDto ticket, MouseEventArgs e, bool force)
+    {
+        if (_reprocessingIds.Contains(ticket.Id)) return;
+        _reprocessingIds.Add(ticket.Id);
+        try
+        {
+            var resp = await Http.PostAsync($"api/tickets/{ticket.Id}/reprocess?force={(force ? "true" : "false")}", null);
+            if (resp.IsSuccessStatusCode)
+            {
+                var updated = await resp.Content.ReadFromJsonAsync<ExpenseTicketDto>();
+                if (updated != null)
+                {
+                    var idx = _tickets.FindIndex(x => x.Id == ticket.Id);
+                    if (idx >= 0) _tickets[idx] = updated;
+                    if (_selected?.Id == ticket.Id) _selected = updated;
+                }
+            }
+            else if ((int)resp.StatusCode == 409 && ticket.Status == "Processing" && !force)
+            {
+                _error = "Conflicto: ya se procesa. Use botón Forzar.";
+            }
+            else
+            {
+                _error = $"No se pudo reprocesar (HTTP {(int)resp.StatusCode})";
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _reprocessingIds.Remove(ticket.Id);
             StateHasChanged();
         }
     }

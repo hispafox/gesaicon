@@ -12,7 +12,8 @@ public record ExpenseTicketDto(
     string? Category,
     DateTime UploadedAt,
     string? AnalysisFileUrl,
-    string? AnalysisFileName
+    string? AnalysisFileName,
+    string? LastErrorMessage
 );
 
 public record PagedResult<T>(int Total, List<T> Items);

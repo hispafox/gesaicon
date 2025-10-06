@@ -2,9 +2,9 @@ using Gesaicon.Api.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using Serilog;
-using Microsoft.Extensions.FileProviders; // agregado
-using System.Threading.RateLimiting; // rate limiting
-using Microsoft.AspNetCore.RateLimiting; // extension AddRateLimiter
+using Microsoft.Extensions.FileProviders;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.RateLimiting;
 using Gesaicon.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -95,9 +95,16 @@ builder.Services.AddHttpClient();
 // Background queue & scheduled batch
 builder.Services.AddSingleton<ReceiptAnalysisQueueService>();
 builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>());
-builder.Services.AddSingleton<IReceiptAnalysisQueue>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>());
+builder.Services.AddSingleton<IReceiptAnalysisQueue>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>()); // corregido
 
 builder.Services.AddHostedService<ScheduledBatchAnalysisService>();
+
+// File ingestion options + hosted service
+builder.Services.Configure<FileIngestionOptions>(builder.Configuration.GetSection("FileIngestion"));
+if (builder.Configuration.GetSection("FileIngestion").GetValue<bool>("Enabled"))
+{
+    builder.Services.AddHostedService<FolderIngestionService>();
+}
 
 var app = builder.Build();
 
@@ -152,3 +159,6 @@ finally
 {
     Log.CloseAndFlush();
 }
+
+// Make Program class accessible for integration tests
+public partial class Program { }

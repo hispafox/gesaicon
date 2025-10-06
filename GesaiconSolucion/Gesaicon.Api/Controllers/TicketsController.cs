@@ -2,6 +2,8 @@ using Gesaicon.Api.Data;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using System.Text;
+using Gesaicon.Api.Models; // para ExpenseTicket
+using Gesaicon.Api.Services; // agregado para IReceiptAnalysisQueue
 
 namespace Gesaicon.Api.Controllers;
 
@@ -11,11 +13,13 @@ public class TicketsController : ControllerBase
 {
     private readonly GesaiconDbContext _db;
     private readonly ILogger<TicketsController> _logger;
+    private readonly IReceiptAnalysisQueue _queue; // nuevo
 
-    public TicketsController(GesaiconDbContext db, ILogger<TicketsController> logger)
+    public TicketsController(GesaiconDbContext db, ILogger<TicketsController> logger, IReceiptAnalysisQueue queue) // actualizado
     {
         _db = db;
         _logger = logger;
+        _queue = queue;
     }
 
     public record ExpenseTicketDto(
@@ -30,7 +34,8 @@ public class TicketsController : ControllerBase
         string? Category,
         DateTime UploadedAt,
         string? AnalysisFileUrl,
-        string? AnalysisFileName
+        string? AnalysisFileName,
+        string? LastErrorMessage
     );
 
     public record PagedResult<T>(int Total, IReadOnlyList<T> Items);
@@ -73,13 +78,14 @@ public class TicketsController : ControllerBase
                 t.FileName,
                 t.FileUrl,
                 t.FileSizeBytes ?? 0L,
-                t.Status,
+                t.Status!,
                 t.Amount,
                 t.CompanyName,
                 t.Category,
                 t.UploadedAt,
                 t.AnalysisFileUrl,
-                t.AnalysisFileName
+                t.AnalysisFileName,
+                t.LastErrorMessage
             ))
             .ToListAsync();
 
@@ -99,13 +105,14 @@ public class TicketsController : ControllerBase
                 t.FileName,
                 t.FileUrl,
                 t.FileSizeBytes ?? 0L,
-                t.Status,
+                t.Status!,
                 t.Amount,
                 t.CompanyName,
                 t.Category,
                 t.UploadedAt,
                 t.AnalysisFileUrl,
-                t.AnalysisFileName
+                t.AnalysisFileName,
+                t.LastErrorMessage
             ))
             .FirstOrDefaultAsync();
 
@@ -145,5 +152,51 @@ public class TicketsController : ControllerBase
 
         if (string.IsNullOrWhiteSpace(md)) return NotFound();
         return Content(md!, "text/markdown", Encoding.UTF8);
+    }
+
+    // Endpoint para re-procesar un ticket manualmente (force permite romper estado Processing atascado)
+    [HttpPost("{id:int}/reprocess")]
+    [ProducesResponseType(typeof(ExpenseTicketDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> Reprocess(int id, [FromQuery] bool force = false)
+    {
+        var ticket = await _db.ExpenseTickets.FirstOrDefaultAsync(t => t.Id == id);
+        if (ticket == null) return NotFound();
+
+        if (ticket.Status == "Processing" && !force)
+            return Conflict(new { message = "Ya se está procesando (use force=true si está atascado)" });
+
+        // Reiniciar campos de análisis
+        ticket.Amount = null;
+        ticket.CompanyName = null;
+        ticket.Category = null;
+        ticket.AnalysisMarkdown = null;
+        ticket.AnalysisJson = null;
+        ticket.AnalysisFileName = null;
+        ticket.AnalysisFileUrl = null;
+        ticket.Status = "PendingAnalysis";
+        ticket.RetryCount += 1;
+        ticket.LastErrorMessage = null; // Limpiar error anterior
+        await _db.SaveChangesAsync();
+
+        await _queue.EnqueueAsync(ticket.Id, ticket.RetryCount);
+
+        var dto = new ExpenseTicketDto(
+            ticket.Id,
+            ticket.PublicId,
+            ticket.FileName,
+            ticket.FileUrl,
+            ticket.FileSizeBytes ?? 0L,
+            ticket.Status!,
+            ticket.Amount,
+            ticket.CompanyName,
+            ticket.Category,
+            ticket.UploadedAt,
+            ticket.AnalysisFileUrl,
+            ticket.AnalysisFileName,
+            ticket.LastErrorMessage
+        );
+        return Ok(dto);
     }
 }

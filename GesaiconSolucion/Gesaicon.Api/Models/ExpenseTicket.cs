@@ -21,5 +21,6 @@ namespace Gesaicon.Api.Models
         public string? AnalysisFileName { get; set; } // nuevo: nombre archivo markdown persistido
         public string? AnalysisFileUrl { get; set; } // nuevo: url pública del archivo markdown
         public int RetryCount { get; set; } // reintentos de análisis automáticos
+        public string? LastErrorMessage { get; set; } // último mensaje de error si Status == "Error"
     }
 }
