@@ -12,16 +12,15 @@ public class FileIngestionOptions
 {
     public bool Enabled { get; set; } = false;
     public string SourceFolder { get; set; } = "Incoming";
-    public string BackupFolder { get; set; } = "IncomingBackup";
-    public string ProcessedFolder { get; set; } = "IncomingProcessed";
-    public string ErrorFolder { get; set; } = "IncomingError";
+    public string BackupFolder { get; } = "IncomingBackup";
+    public string ProcessedFolder { get; } = "IncomingProcessed";
+    public string ErrorFolder { get; } = "IncomingError";
     public int ScanIntervalSeconds { get; set; } = 15;
     public int StableAgeSeconds { get; set; } = 5;
     public int MaxPerScan { get; set; } = 25;
     public bool EnqueueForAnalysis { get; set; } = true;
     public string[] AllowedExtensions { get; set; } = new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp" };
     public string DefaultCompanySlug { get; set; } = "default"; // temporal
-    public bool ForceReprocessAll { get; set; } = false;
 }
 
 public class FolderIngestionService : BackgroundService
@@ -167,7 +166,7 @@ public class FolderIngestionService : BackgroundService
             .AsNoTracking()
             .FirstOrDefaultAsync(t => t.FileHash == hash, ct);
 
-        if (dup != null && !_opt.ForceReprocessAll)
+        if (dup != null)
         {
             _logger.LogInformation("[Ingestion] Archivo {File} duplicado de TicketId={Id}", fileName, dup.Id);
             MoveToProcessed(originalPath, processedDir, "DUP");
