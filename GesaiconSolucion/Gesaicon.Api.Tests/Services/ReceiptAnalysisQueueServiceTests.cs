@@ -11,35 +11,35 @@ namespace Gesaicon.Api.Tests.Services
     {
         private readonly Mock<ILogger<ReceiptAnalysisQueueService>> _mockLogger;
         private readonly Mock<IConfiguration> _mockConfig;
-        private readonly Mock<IHttpClientFactory> _mockHttpClientFactory;
-        private readonly Mock<IAnalysisPromptProvider> _mockPromptProvider;
         private readonly Mock<IServiceProvider> _mockServiceProvider;
+        private readonly Mock<IReceiptAnalysisProcessor> _mockProcessor;
 
         public ReceiptAnalysisQueueServiceTests()
         {
             _mockLogger = new Mock<ILogger<ReceiptAnalysisQueueService>>();
             _mockConfig = new Mock<IConfiguration>();
-            _mockHttpClientFactory = new Mock<IHttpClientFactory>();
-            _mockPromptProvider = new Mock<IAnalysisPromptProvider>();
             _mockServiceProvider = new Mock<IServiceProvider>();
-            
-            // Configurar el mock de IConfiguration para retornar valores por defecto
-            var mockSection = new Mock<IConfigurationSection>();
-            mockSection.Setup(x => x.Value).Returns("500");
-            _mockConfig.Setup(c => c.GetSection("Analysis:Queue:Capacity")).Returns(mockSection.Object);
-            _mockConfig.Setup(c => c["Analysis:Queue:Capacity"]).Returns("500");
+            _mockProcessor = new Mock<IReceiptAnalysisProcessor>();
+            _mockProcessor.Setup(p => p.AnalyzeAsync(It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            // Config (capacity, attempts, backoff)
+            _mockConfig.Setup(c => c.GetValue<int?>("Analysis:Queue:Capacity")).Returns(500);
+            _mockConfig.Setup(c => c.GetValue<int?>("Analysis:Queue:MaxAttempts")).Returns(3);
+            _mockConfig.Setup(c => c.GetValue<int?>("Analysis:Queue:RetryBackoffSeconds")).Returns(1); // backoff bajo para tests
         }
+
+        private ReceiptAnalysisQueueService CreateService() => new(
+            _mockServiceProvider.Object,
+            _mockLogger.Object,
+            _mockConfig.Object,
+            _mockProcessor.Object);
 
         [Fact]
         public void Constructor_InitializesCorrectly()
         {
             // Act
-            var service = new ReceiptAnalysisQueueService(
-                _mockServiceProvider.Object,
-                _mockLogger.Object,
-                _mockConfig.Object,
-                _mockHttpClientFactory.Object,
-                _mockPromptProvider.Object);
+            var service = CreateService();
 
             // Assert
             service.Should().NotBeNull();
@@ -50,18 +50,13 @@ namespace Gesaicon.Api.Tests.Services
         public async Task EnqueueAsync_AddsItemToQueue()
         {
             // Arrange
-            var service = new ReceiptAnalysisQueueService(
-                _mockServiceProvider.Object,
-                _mockLogger.Object,
-                _mockConfig.Object,
-                _mockHttpClientFactory.Object,
-                _mockPromptProvider.Object);
+            var service = CreateService();
 
             // Act
             var enqueueTask = service.EnqueueAsync(1, 1);
 
             // Assert
-            await enqueueTask; // No debería lanzar excepción
+            await enqueueTask;
             enqueueTask.IsCompleted.Should().BeTrue();
         }
 
@@ -69,12 +64,7 @@ namespace Gesaicon.Api.Tests.Services
         public async Task EnqueueAsync_HandlesMultipleItems()
         {
             // Arrange
-            var service = new ReceiptAnalysisQueueService(
-                _mockServiceProvider.Object,
-                _mockLogger.Object,
-                _mockConfig.Object,
-                _mockHttpClientFactory.Object,
-                _mockPromptProvider.Object);
+            var service = CreateService();
 
             // Act
             var tasks = new List<ValueTask>
@@ -110,18 +100,12 @@ namespace Gesaicon.Api.Tests.Services
         public async Task EnqueueAsync_AcceptsDifferentTicketIdsAndAttempts(int ticketId, int attempt)
         {
             // Arrange
-            var service = new ReceiptAnalysisQueueService(
-                _mockServiceProvider.Object,
-                _mockLogger.Object,
-                _mockConfig.Object,
-                _mockHttpClientFactory.Object,
-                _mockPromptProvider.Object);
+            var service = CreateService();
 
             // Act
             await service.EnqueueAsync(ticketId, attempt);
 
             // Assert
-            // Si no lanza excepción, el test pasa
             true.Should().BeTrue();
         }
 
@@ -129,12 +113,7 @@ namespace Gesaicon.Api.Tests.Services
         public void Service_ImplementsIReceiptAnalysisQueue()
         {
             // Arrange & Act
-            var service = new ReceiptAnalysisQueueService(
-                _mockServiceProvider.Object,
-                _mockLogger.Object,
-                _mockConfig.Object,
-                _mockHttpClientFactory.Object,
-                _mockPromptProvider.Object);
+            var service = CreateService();
 
             // Assert
             service.Should().BeAssignableTo<IReceiptAnalysisQueue>();

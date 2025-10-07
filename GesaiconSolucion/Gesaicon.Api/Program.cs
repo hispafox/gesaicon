@@ -111,13 +111,11 @@ builder.Services.AddSingleton<IFileStorageService, FileStorageService>();
 // HttpClient
 builder.Services.AddHttpClient();
 
-// Background queue & scheduled batch
+// Background queue & processor (UNICA COLA)
+builder.Services.AddSingleton<IReceiptAnalysisProcessor, ReceiptAnalysisProcessor>();
 builder.Services.AddSingleton<ReceiptAnalysisQueueService>();
 builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>());
-builder.Services.AddSingleton<IReceiptAnalysisQueue>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>()); // corregido
-
-// Scheduled batch analysis service
-builder.Services.AddHostedService<ScheduledBatchAnalysisService>();
+builder.Services.AddSingleton<IReceiptAnalysisQueue>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>());
 
 // File ingestion options + hosted service
 builder.Services.Configure<FileIngestionOptions>(builder.Configuration.GetSection("FileIngestion"));
@@ -125,12 +123,6 @@ if (builder.Configuration.GetSection("FileIngestion").GetValue<bool>("Enabled"))
 {
     builder.Services.AddHostedService<FolderIngestionService>();
 }
-
-// Legacy fix DESPUÉS de la ingesta para que encuentre tickets placeholder
-//builder.Services.AddHostedService<LegacyTicketFixService>();
-
-// Servicio de reparación de rutas - ejecuta una vez al inicio
-//builder.Services.AddHostedService<TicketPathRepairService>();
 
 var app = builder.Build();
 
@@ -147,7 +139,6 @@ app.Use(async (context, next) =>
     }
 });
 
-// MOVER CORS ANTES DEL RATE LIMITER
 app.UseCors("AllowBlazor");
 
 // No aplicar rate limiter en ambiente de Testing
