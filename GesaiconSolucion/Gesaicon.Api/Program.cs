@@ -1,4 +1,5 @@
 using Gesaicon.Api.Data;
+using Gesaicon.Api.Services.Storage;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using Serilog;
@@ -100,6 +101,10 @@ builder.Services.AddDbContext<GesaiconDbContext>(options =>
     }
 });
 
+// File storage infrastructure
+builder.Services.AddSingleton<IBusinessFilePathStrategy, BusinessFilePathStrategy>();
+builder.Services.AddSingleton<IFileStorageService, FileStorageService>();
+
 // HttpClient
 builder.Services.AddHttpClient();
 
@@ -109,6 +114,9 @@ builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<Receip
 builder.Services.AddSingleton<IReceiptAnalysisQueue>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>()); // corregido
 
 builder.Services.AddHostedService<ScheduledBatchAnalysisService>();
+
+// Corrección automática de tickets legacy al arranque
+builder.Services.AddHostedService<LegacyTicketFixService>();
 
 // File ingestion options + hosted service
 builder.Services.Configure<FileIngestionOptions>(builder.Configuration.GetSection("FileIngestion"));
@@ -160,6 +168,24 @@ app.UseHttpsRedirection();
 app.UseAuthorization();
 
 app.MapControllers().RequireRateLimiting("receipt-analysis");
+
+// Herramienta de migración (ejecutar con: dotnet run -- migrate-uploads [--dry-run] [--company-slug nombre] [--force-company])
+if (args.Length > 0 && args[0] == "migrate-uploads")
+{
+    var dryRun = args.Contains("--dry-run");
+    var forceCompany = args.Contains("--force-company");
+    var companySlug = "default";
+    var slugIndex = Array.IndexOf(args, "--company-slug");
+    if (slugIndex >= 0 && slugIndex + 1 < args.Length)
+    {
+        companySlug = args[slugIndex + 1];
+    }
+    
+    using var scope = app.Services.CreateScope();
+    await Gesaicon.Api.Tools.MigrateUploadsToNewStructure.RunAsync(
+        scope.ServiceProvider, dryRun, companySlug, forceCompany, CancellationToken.None);
+    return;
+}
 
 try
 {

@@ -5,6 +5,7 @@ using Gesaicon.Api.Controllers;
 using Gesaicon.Api.Models;
 using Gesaicon.Api.Data;
 using Gesaicon.Api.Services;
+using Gesaicon.Api.Services.Storage;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -16,6 +17,7 @@ namespace Gesaicon.Api.Tests.Controllers
         private readonly GesaiconDbContext _context;
         private readonly Mock<ILogger<TicketsController>> _mockLogger;
         private readonly Mock<IReceiptAnalysisQueue> _mockQueue;
+        private readonly Mock<IFileStorageService> _mockStorage;
         private readonly TicketsController _controller;
 
         public TicketsControllerTests()
@@ -28,6 +30,7 @@ namespace Gesaicon.Api.Tests.Controllers
             _context = new GesaiconDbContext(options);
             _mockLogger = new Mock<ILogger<TicketsController>>();
             _mockQueue = new Mock<IReceiptAnalysisQueue>();
+            _mockStorage = new Mock<IFileStorageService>();
             
             _controller = new TicketsController(_context, _mockLogger.Object, _mockQueue.Object);
 
@@ -253,7 +256,7 @@ namespace Gesaicon.Api.Tests.Controllers
         public async Task GetAnalysisMarkdown_ReturnsNotFound_WhenTicketDoesNotExist()
         {
             // Act
-            var result = await _controller.GetAnalysisMarkdown(999);
+            var result = await _controller.GetAnalysisMarkdown(999, _mockStorage.Object);
 
             // Assert
             result.Should().BeOfType<NotFoundResult>();
@@ -263,7 +266,7 @@ namespace Gesaicon.Api.Tests.Controllers
         public async Task GetAnalysisMarkdown_ReturnsNotFound_WhenNoAnalysis()
         {
             // Act
-            var result = await _controller.GetAnalysisMarkdown(2);
+            var result = await _controller.GetAnalysisMarkdown(2, _mockStorage.Object);
 
             // Assert
             result.Should().BeOfType<NotFoundResult>();

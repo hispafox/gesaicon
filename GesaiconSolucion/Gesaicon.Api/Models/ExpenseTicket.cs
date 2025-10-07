@@ -6,8 +6,16 @@ namespace Gesaicon.Api.Models
     {
         public int Id { get; set; }
         public Guid PublicId { get; set; } // nuevo identificador público estable
+        
+        // Nuevos campos para estructura empresas/año/mes
+        public string? CompanySlug { get; set; }
+        public int? ExpenseYear { get; set; }
+        public int? ExpenseMonth { get; set; }
+        
         public string? FileName { get; set; }
         public string? FileUrl { get; set; }
+        public string? RelativePath { get; set; } // NUEVO: guarda la ruta relativa completa desde Uploads
+        
         public long? FileSizeBytes { get; set; } // tamaño
         public string? FileHash { get; set; } // hash SHA256 para duplicados
         [Column(TypeName="decimal(18,2)")] public decimal? Amount { get; set; }

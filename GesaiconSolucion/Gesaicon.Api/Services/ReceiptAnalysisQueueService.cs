@@ -1,5 +1,6 @@
 using System.Threading.Channels;
 using Gesaicon.Api.Data;
+using Gesaicon.Api.Services.Storage;
 using Microsoft.EntityFrameworkCore;
 using Gesaicon.Api.Models;
 using SixLabors.ImageSharp;
@@ -143,15 +144,27 @@ namespace Gesaicon.Api.Services
                 // Usar un scope dedicado para la lógica principal para evitar problemas de concurrencia con DbContext
                 using var processingScope = _sp.CreateScope();
                 var db = processingScope.ServiceProvider.GetRequiredService<GesaiconDbContext>();
+                var storage = processingScope.ServiceProvider.GetRequiredService<IFileStorageService>();
+                
                 ticketForUpdate = await db.ExpenseTickets.FirstOrDefaultAsync(t => t.Id == item.TicketId, ct);
                 if (ticketForUpdate == null) throw new Exception("Ticket no encontrado en el segundo scope");
 
-                var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
-                var fileName = ticketForUpdate.FileName ?? string.Empty;
-                var filePath = string.IsNullOrWhiteSpace(ticketForUpdate.FileUrl) ? null : Path.Combine(uploadsDir, fileName);
+                // Usar RelativePath con fallback a estructura legacy
+                string? filePath = null;
+                if (!string.IsNullOrWhiteSpace(ticketForUpdate.RelativePath))
+                {
+                    filePath = storage.GetPhysicalPath(ticketForUpdate.RelativePath);
+                }
+                else if (!string.IsNullOrWhiteSpace(ticketForUpdate.FileName))
+                {
+                    // Fallback para tickets legacy (estructura antigua)
+                    var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+                    filePath = Path.Combine(uploadsDir, ticketForUpdate.FileName);
+                }
+
                 if (filePath == null || !File.Exists(filePath))
                 {
-                    _logger.LogWarning("[QueueService] Archivo ticket {Id} no encontrado", ticketForUpdate.Id);
+                    _logger.LogWarning("[QueueService] Archivo ticket {Id} no encontrado en {Path}", ticketForUpdate.Id, filePath);
                     ticketForUpdate.Status = "Error"; 
                     ticketForUpdate.LastErrorMessage = "Archivo no encontrado";
                     log.Success = false; log.ErrorMessage = "File not found";
@@ -240,11 +253,29 @@ namespace Gesaicon.Api.Services
                             if (!string.IsNullOrWhiteSpace(markdownPart))
                             {
                                 var analysisFileName = ticketForUpdate.PublicId + "-analysis.md";
-                                var analysisPath = Path.Combine(uploadsDir, analysisFileName);
+                                
+                                // Guardar en la misma carpeta que el ticket
+                                string analysisPath;
+                                string analysisRelPath;
+                                if (!string.IsNullOrWhiteSpace(ticketForUpdate.RelativePath))
+                                {
+                                    var dir = Path.GetDirectoryName(ticketForUpdate.RelativePath);
+                                    analysisRelPath = Path.Combine(dir!, analysisFileName).Replace('\\', '/');
+                                    analysisPath = storage.GetPhysicalPath(analysisRelPath);
+                                }
+                                else
+                                {
+                                    // Fallback legacy
+                                    var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+                                    analysisPath = Path.Combine(uploadsDir, analysisFileName);
+                                    analysisRelPath = analysisFileName;
+                                }
+                                
+                                Directory.CreateDirectory(Path.GetDirectoryName(analysisPath)!);
                                 await File.WriteAllTextAsync(analysisPath, markdownPart, System.Text.Encoding.UTF8, ct);
                                 ticketForUpdate.AnalysisMarkdown = markdownPart;
                                 ticketForUpdate.AnalysisFileName = analysisFileName;
-                                ticketForUpdate.AnalysisFileUrl = $"/Uploads/{analysisFileName}";
+                                ticketForUpdate.AnalysisFileUrl = $"/Uploads/{analysisRelPath}";
                             }
                             ticketForUpdate.Status = "Completed";
                             log.Amount = ticketForUpdate.Amount; log.Company = ticketForUpdate.CompanyName; log.Category = ticketForUpdate.Category;

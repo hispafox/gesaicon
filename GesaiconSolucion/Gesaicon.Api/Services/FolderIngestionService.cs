@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using Gesaicon.Api.Data;
 using Gesaicon.Api.Models;
+using Gesaicon.Api.Services.Storage;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
@@ -18,6 +19,12 @@ public class FileIngestionOptions
     public int MaxPerScan { get; set; } = 25;
     public bool EnqueueForAnalysis { get; set; } = true;
     public string[] AllowedExtensions { get; set; } = new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp" };
+    
+    // NUEVO: valor por defecto para ingesta automática
+    public string DefaultCompanySlug { get; set; } = "default";
+    
+    // NUEVO: Forzar reprocesamiento de todos los tickets (incluso los que ya están correctos)
+    public bool ForceReprocessAll { get; set; } = false;
 }
 
 public class FolderIngestionService : BackgroundService
@@ -126,7 +133,6 @@ public class FolderIngestionService : BackgroundService
     private async Task ProcessFileAsync(string originalPath, CancellationToken ct)
     {
         var fileName = Path.GetFileName(originalPath);
-        var ext = Path.GetExtension(fileName);
         var processedDir = Path.Combine(_env.ContentRootPath, _opt.ProcessedFolder);
         var backupDir = Path.Combine(_env.ContentRootPath, _opt.BackupFolder);
 
@@ -155,7 +161,7 @@ public class FolderIngestionService : BackgroundService
             .AsNoTracking()
             .FirstOrDefaultAsync(t => t.FileHash == hash, ct);
 
-        if (dup != null)
+        if (dup != null && !_opt.ForceReprocessAll)
         {
             _logger.LogInformation("[Ingestion] Archivo {File} duplicado de TicketId={Id}", fileName, dup.Id);
             MoveToProcessed(originalPath, processedDir, "DUP");
@@ -172,20 +178,36 @@ public class FolderIngestionService : BackgroundService
             _logger.LogWarning(ex, "[Ingestion] No se pudo crear backup para {File}", fileName);
         }
 
-        var uploadsDir = Path.Combine(_env.ContentRootPath, "Uploads");
-        if (!Directory.Exists(uploadsDir)) Directory.CreateDirectory(uploadsDir);
         var publicId = Guid.NewGuid();
-        var newName = publicId + ext;
-        var destPath = Path.Combine(uploadsDir, newName);
-        await File.WriteAllBytesAsync(destPath, data, ct);
+        var now = DateTime.UtcNow;
+        
+        // Usar nueva estructura de storage
+        var storage = scope.ServiceProvider.GetRequiredService<IFileStorageService>();
+        StoredFileInfo stored;
+        
+        using (var ms = new MemoryStream(data))
+        {
+            stored = await storage.SaveTicketFileAsync(
+                ms,
+                _opt.DefaultCompanySlug,
+                now.Year,
+                now.Month,
+                publicId.ToString("N"),
+                fileName,
+                ct);
+        }
 
         var ticket = new ExpenseTicket
         {
             PublicId = publicId,
-            FileName = newName,
-            FileUrl = $"/Uploads/{newName}",
-            FileSizeBytes = data.Length,
-            FileHash = hash,
+            CompanySlug = _opt.DefaultCompanySlug,
+            ExpenseYear = now.Year,
+            ExpenseMonth = now.Month,
+            FileName = stored.OriginalFileName,
+            RelativePath = stored.RelativePath,
+            FileUrl = $"/Uploads/{stored.RelativePath}",
+            FileSizeBytes = stored.SizeBytes,
+            FileHash = stored.Hash,
             UploadedAt = DateTime.UtcNow,
             Status = _opt.EnqueueForAnalysis ? "PendingAnalysis" : "Uploaded",
             RetryCount = 0

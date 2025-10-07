@@ -46,7 +46,23 @@
     }
 </style>
 
-<h3 class="mb-4">Gestor de Archivos</h3>
+<h3 class="mb-4">
+    Gestor de Archivos
+    @if (_legacyCount > 0)
+    {
+        <span class="badge bg-warning text-dark ms-2" title="Archivos en estructura antigua que necesitan migración">
+            <i class="bi bi-exclamation-triangle-fill me-1"></i>
+            @_legacyCount Legacy
+        </span>
+    }
+    else if (_total > 0)
+    {
+        <span class="badge bg-success ms-2">
+            <i class="bi bi-check-circle-fill me-1"></i>
+            Todo migrado
+        </span>
+    }
+</h3>
 
 <div class="mb-3 d-flex gap-2 flex-wrap align-items-start">
     <input class="form-control" style="max-width:260px" placeholder="Buscar..."
@@ -57,6 +73,11 @@
         <option>Completed</option>
         <option>Error</option>
     </select>
+    <select class="form-select" style="max-width:160px" @bind="_structureFilter" @bind:after="LoadAsync">
+        <option value="">(Estructura)</option>
+        <option value="legacy">?? Solo Legacy</option>
+        <option value="new">? Solo Nueva</option>
+    </select>
     <select class="form-select" style="max-width:120px" @bind="_pageSize">
         <option value="20">20</option>
         <option value="50" selected>50</option>
@@ -66,7 +87,43 @@
         @if(_loading) { <span class="spinner-border spinner-border-sm me-1"></span> }
         Recargar
     </button>
+    @if (_legacyCount > 0 && string.IsNullOrEmpty(_structureFilter))
+    {
+        <button class="btn btn-warning" @onclick='() => { _structureFilter = "legacy"; LoadAsync(); }' title="Mostrar solo archivos legacy">
+            <i class="bi bi-filter me-1"></i>
+            Ver @_legacyCount Legacy
+        </button>
+    }
 </div>
+
+@if (_legacyCount > 0 && string.IsNullOrEmpty(_structureFilter))
+{
+    <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
+        <i class="bi bi-exclamation-triangle-fill fs-4 me-3"></i>
+        <div class="flex-grow-1">
+            <strong>Archivos Legacy Detectados</strong>
+            <p class="mb-0 small">
+                Hay <strong>@_legacyCount archivos</strong> en estructura antigua que deberían migrarse.
+                <button class="btn btn-sm btn-outline-warning ms-2" @onclick='() => { _structureFilter = "legacy"; LoadAsync(); }'>
+                    <i class="bi bi-filter me-1"></i>
+                    Mostrar solo legacy
+                </button>
+            </p>
+        </div>
+        <div class="text-end">
+            <small class="text-muted d-block">Progreso de migración</small>
+            <div class="progress" style="width: 200px; height: 8px;">
+                <div class="progress-bar bg-success" role="progressbar" 
+                     style="width: @((_total - _legacyCount) * 100.0 / _total)%"
+                     aria-valuenow="@(_total - _legacyCount)" 
+                     aria-valuemin="0" 
+                     aria-valuemax="@_total">
+                </div>
+            </div>
+            <small class="text-muted">@((_total - _legacyCount) * 100 / _total)% migrado</small>
+        </div>
+    </div>
+}
 
 @if (_loading)
 {
@@ -90,6 +147,7 @@ else
                         <tr>
                             <th class="px-3">Id</th>
                             <th>Archivo</th>
+                            <th>Ruta / Estructura</th>
                             <th>Empresa</th>
                             <th>Categoría</th>
                             <th class="text-end">Importe</th>
@@ -103,7 +161,36 @@ else
                     {
                         <tr @onclick="(() => OpenModal(t))" style="cursor:pointer">
                             <td class="px-3">@t.Id</td>
-                            <td>@t.FileName</td>
+                            <td>
+                                <div class="d-flex flex-column">
+                                    <span>@t.FileName</span>
+                                    @if (t.IsLegacy)
+                                    {
+                                        <small class="text-danger">
+                                            <i class="bi bi-exclamation-triangle-fill me-1"></i>
+                                            <strong>Legacy</strong>
+                                        </small>
+                                    }
+                                </div>
+                            </td>
+                            <td>
+                                <small class="text-muted" style="font-family: monospace">
+                                    @if (t.IsLegacy)
+                                    {
+                                        <span class="badge bg-warning text-dark">
+                                            <i class="bi bi-folder2-open me-1"></i>
+                                            Uploads/
+                                        </span>
+                                    }
+                                    else
+                                    {
+                                        <span class="badge bg-success">
+                                            <i class="bi bi-folder-check me-1"></i>
+                                            @t.ShortPath
+                                        </span>
+                                    }
+                                </small>
+                            </td>
                             <td>@t.CompanyName</td>
                             <td>@t.Category</td>
                             <td class="text-end">@((t.Amount)?.ToString("0.00"))</td>
@@ -127,6 +214,16 @@ else
                                             <i class="bi bi-file-earmark-text"></i>
                                         </button>
                                     }
+                                    @if (t.IsLegacy)
+                                    {
+                                        <button class="btn btn-sm btn-warning btn-action" title="Migrar a nueva estructura" disabled="@(_migratingIds.Contains(t.Id))" @onclick="(e=> MigrateTicket(t, e))" @onclick:stopPropagation>
+                                            @if(_migratingIds.Contains(t.Id)) { 
+                                                <span class="spinner-border spinner-border-sm"></span> 
+                                            } else { 
+                                                <i class="bi bi-arrow-right-circle"></i> 
+                                            }
+                                        </button>
+                                    }
                                     <button class="btn btn-sm btn-outline-primary btn-action" title="Reprocesar" disabled="@(_reprocessingIds.Contains(t.Id))" @onclick="(e=> Reprocess(t, e, false))" @onclick:stopPropagation>
                                         @if(_reprocessingIds.Contains(t.Id)) { 
                                             <span class="spinner-border spinner-border-sm"></span> 
@@ -145,7 +242,22 @@ else
     </div>
 
     <div class="d-flex justify-content-between align-items-center mt-3">
-        <div class="text-muted">Total: <strong>@_total</strong> tickets</div>
+        <div class="text-muted">
+            <strong>@_total</strong> tickets totales
+            @if (_legacyCount > 0)
+            {
+                <span class="text-warning ms-2">
+                    (<i class="bi bi-exclamation-triangle-fill me-1"></i>@_legacyCount legacy)
+                </span>
+            }
+            @if (!string.IsNullOrWhiteSpace(_structureFilter))
+            {
+                <span class="badge bg-info ms-2">
+                    <i class="bi bi-funnel me-1"></i>
+                    Filtrado: @(_structureFilter == "legacy" ? "Solo Legacy" : "Solo Nueva Estructura")
+                </span>
+            }
+        </div>
         <nav>
             <ul class="pagination pagination-sm mb-0">
                 <li class="page-item @(_page==0 ? "disabled" : "")">
@@ -177,8 +289,44 @@ else
                 </div>
                 <div class="modal-body modal-body-scroll">
                     <!-- Acciones rápidas -->
-                    <div class="mb-3 d-flex gap-2 align-items-center">
+                    <div class="mb-3 d-flex gap-2 align-items-center flex-wrap">
                         <span class="status-badge @GetStatusClass(_selected.Status)">@_selected.Status</span>
+                        
+                        @if (_selected.IsLegacy)
+                        {
+                            <span class="badge bg-warning text-dark fs-6">
+                                <i class="bi bi-exclamation-triangle-fill me-1"></i>
+                                Archivo Legacy
+                            </span>
+                            <button class="btn btn-sm btn-warning" disabled="@_migratingIds.Contains(_selected.Id)" @onclick="(e=> MigrateTicket(_selected, e))">
+                                @if(_migratingIds.Contains(_selected.Id)) { 
+                                    <span class="spinner-border spinner-border-sm me-1"></span> 
+                                } else { 
+                                    <i class="bi bi-arrow-right-circle me-1"></i> 
+                                }
+                                Migrar a Nueva Estructura
+                            </button>
+                        }
+                        else
+                        {
+                            <span class="badge bg-success fs-6">
+                                <i class="bi bi-check-circle-fill me-1"></i>
+                                Nueva Estructura
+                            </span>
+                            
+                            @if (_selected.CompanySlug == "default" && !string.IsNullOrWhiteSpace(_selected.CompanyName))
+                            {
+                                <button class="btn btn-sm btn-warning" disabled="@_fixingSlugIds.Contains(_selected.Id)" @onclick="(e=> FixCompanySlug(_selected, e))">
+                                    @if(_fixingSlugIds.Contains(_selected.Id)) { 
+                                        <span class="spinner-border spinner-border-sm me-1"></span> 
+                                    } else { 
+                                        <i class="bi bi-wrench me-1"></i> 
+                                    }
+                                    Corregir Empresa
+                                </button>
+                            }
+                        }
+                        
                         <button class="btn btn-sm btn-primary" disabled="@_reprocessingIds.Contains(_selected.Id)" @onclick="(e=> Reprocess(_selected, e, false))">
                             @if(_reprocessingIds.Contains(_selected.Id)) { 
                                 <span class="spinner-border spinner-border-sm me-1"></span> 
@@ -221,6 +369,43 @@ else
                                         
                                         <dt class="col-5 text-muted">Archivo</dt>
                                         <dd class="col-7">@_selected.FileName</dd>
+                                        
+                                        <dt class="col-5 text-muted">Estructura</dt>
+                                        <dd class="col-7">
+                                            @if (_selected.IsLegacy)
+                                            {
+                                                <span class="badge bg-warning text-dark">
+                                                    <i class="bi bi-folder2-open me-1"></i>
+                                                    Legacy
+                                                </span>
+                                                <div class="mt-1">
+                                                    <small class="text-muted" style="font-family: monospace">
+                                                        Uploads/@_selected.FileName
+                                                    </small>
+                                                </div>
+                                            }
+                                            else
+                                            {
+                                                <span class="badge bg-success">
+                                                    <i class="bi bi-folder-check me-1"></i>
+                                                    Nueva
+                                                </span>
+                                                <div class="mt-1">
+                                                    <small class="text-muted" style="font-family: monospace">
+                                                        @_selected.RelativePath
+                                                    </small>
+                                                </div>
+                                            }
+                                        </dd>
+                                        
+                                        @if (!_selected.IsLegacy)
+                                        {
+                                            <dt class="col-5 text-muted">Empresa</dt>
+                                            <dd class="col-7"><code class="small">@_selected.CompanySlug</code></dd>
+                                            
+                                            <dt class="col-5 text-muted">Periodo</dt>
+                                            <dd class="col-7">@_selected.ExpenseYear/@_selected.ExpenseMonth?.ToString("00")</dd>
+                                        }
                                         
                                         <dt class="col-5 text-muted">Tamaño</dt>
                                         <dd class="col-7">@FormatFileSize(_selected.FileSizeBytes)</dd>
@@ -318,9 +503,11 @@ else
     private ExpenseTicketDto? _selected;
     private bool _showModal = false;
     private int _total;
+    private int _legacyCount;
     private int _page = 0;
     private int _pageSize = 50;
     private string? _statusFilter;
+    private string? _structureFilter;
     private string _search = "";
     private bool _loading;
     private string? _error;
@@ -330,6 +517,8 @@ else
     private string? _analysisError;
 
     private HashSet<int> _reprocessingIds = new();
+    private HashSet<int> _migratingIds = new();
+    private HashSet<int> _fixingSlugIds = new();
 
     protected override async Task OnInitializedAsync()
     {
@@ -371,8 +560,26 @@ else
                 qs += $"&search={Uri.EscapeDataString(_search)}";
 
             var result = await Http.GetFromJsonAsync<PagedResult<ExpenseTicketDto>>(qs);
-            _tickets = result?.Items ?? new();
+            var allTickets = result?.Items ?? new();
             _total = result?.Total ?? 0;
+            
+            // Calcular cuántos son legacy del total
+            _legacyCount = allTickets.Count(t => t.IsLegacy);
+            
+            // Aplicar filtro de estructura en cliente
+            if (!string.IsNullOrWhiteSpace(_structureFilter))
+            {
+                _tickets = _structureFilter switch
+                {
+                    "legacy" => allTickets.Where(t => t.IsLegacy).ToList(),
+                    "new" => allTickets.Where(t => !t.IsLegacy).ToList(),
+                    _ => allTickets
+                };
+            }
+            else
+            {
+                _tickets = allTickets;
+            }
         }
         catch (Exception ex)
         {
@@ -474,6 +681,111 @@ else
         }
     }
 
+    private async Task MigrateTicket(ExpenseTicketDto ticket, MouseEventArgs e)
+    {
+        if (_migratingIds.Contains(ticket.Id)) return;
+        _migratingIds.Add(ticket.Id);
+        try
+        {
+            // Reprocesar con migrateIfLegacy=true (es el default)
+            var resp = await Http.PostAsync($"api/tickets/{ticket.Id}/reprocess?migrateIfLegacy=true", null);
+            if (resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                var updated = System.Text.Json.JsonDocument.Parse(body);
+                
+                // Verificar si se migró
+                var wasMigrated = updated.RootElement.TryGetProperty("migrated", out var migProp) && migProp.GetBoolean();
+                
+                // Obtener ticket actualizado
+                ExpenseTicketDto? updatedTicket = null;
+                if (updated.RootElement.TryGetProperty("ticket", out var ticketProp))
+                {
+                    updatedTicket = System.Text.Json.JsonSerializer.Deserialize<ExpenseTicketDto>(ticketProp.GetRawText());
+                }
+                else
+                {
+                    updatedTicket = System.Text.Json.JsonSerializer.Deserialize<ExpenseTicketDto>(body);
+                }
+                
+                if (updatedTicket != null)
+                {
+                    var idx = _tickets.FindIndex(x => x.Id == ticket.Id);
+                    if (idx >= 0) _tickets[idx] = updatedTicket;
+                    if (_selected?.Id == ticket.Id) _selected = updatedTicket;
+                    
+                    if (wasMigrated)
+                    {
+                        _error = null;
+                        // Cerrar el modal si se migró exitosamente
+                        CloseModal();
+                        // Recargar la lista para actualizar el contador de legacy
+                        await LoadAsync();
+                    }
+                }
+            }
+            else
+            {
+                _error = $"No se pudo migrar (HTTP {(int)resp.StatusCode})";
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = $"Error al migrar: {ex.Message}";
+        }
+        finally
+        {
+            _migratingIds.Remove(ticket.Id);
+            StateHasChanged();
+        }
+    }
+
+    private async Task FixCompanySlug(ExpenseTicketDto ticket, MouseEventArgs e)
+    {
+        if (_fixingSlugIds.Contains(ticket.Id)) return;
+        _fixingSlugIds.Add(ticket.Id);
+        try
+        {
+            var resp = await Http.PostAsync($"api/tickets/{ticket.Id}/fix-company-slug", null);
+            if (resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                var result = System.Text.Json.JsonDocument.Parse(body);
+                
+                // Obtener ticket actualizado
+                ExpenseTicketDto? updatedTicket = null;
+                if (result.RootElement.TryGetProperty("ticket", out var ticketProp))
+                {
+                    updatedTicket = System.Text.Json.JsonSerializer.Deserialize<ExpenseTicketDto>(ticketProp.GetRawText());
+                }
+                
+                if (updatedTicket != null)
+                {
+                    var idx = _tickets.FindIndex(x => x.Id == ticket.Id);
+                    if (idx >= 0) _tickets[idx] = updatedTicket;
+                    if (_selected?.Id == ticket.Id) _selected = updatedTicket;
+                    
+                    // Mostrar mensaje de éxito
+                    _error = null;
+                }
+            }
+            else
+            {
+                var errorBody = await resp.Content.ReadAsStringAsync();
+                _error = $"No se pudo corregir empresa: {errorBody}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _error = $"Error al corregir empresa: {ex.Message}";
+        }
+        finally
+        {
+            _fixingSlugIds.Remove(ticket.Id);
+            StateHasChanged();
+        }
+    }
+
     private async Task NextPage()
     {
         if (((_page + 1) * _pageSize) >= _total) return;
@@ -505,7 +817,7 @@ else
         html = System.Text.RegularExpressions.Regex.Replace(html, @"^#### (.*)$", "<h4>$1</h4>", System.Text.RegularExpressions.RegexOptions.Multiline);
         html = System.Text.RegularExpressions.Regex.Replace(html, @"^### (.*)$", "<h3>$1</h3>", System.Text.RegularExpressions.RegexOptions.Multiline);
         html = System.Text.RegularExpressions.Regex.Replace(html, @"^## (.*)$", "<h2>$1</h2>", System.Text.RegularExpressions.RegexOptions.Multiline);
-        html = System.Text.RegularExpressions.Regex.Replace(html, @"^# (.*)$", "<h1>$1</h1>", System.Text.RegularExpressions.RegexOptions.Multiline);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"# (.*)$", "<h1>$1</h1>", System.Text.RegularExpressions.RegexOptions.Multiline);
         html = System.Text.RegularExpressions.Regex.Replace(html, @"\*\*(.+?)\*\*", "<strong>$1</strong>");
         html = System.Text.RegularExpressions.Regex.Replace(html, @"\*(.+?)\*", "<em>$1</em>");
         html = html.Replace("\r", "");

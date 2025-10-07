@@ -1,4 +1,5 @@
 using Gesaicon.Api.Data;
+using Gesaicon.Api.Services.Storage;
 using Microsoft.EntityFrameworkCore;
 
 namespace Gesaicon.Api.Services
@@ -93,11 +94,30 @@ namespace Gesaicon.Api.Services
         // TODO: Revisar que funciona
         private async Task ProcessTicketAsync(Gesaicon.Api.Models.ExpenseTicket ticket, GesaiconDbContext db, HttpClient client, string endpoint, string model, CancellationToken ct)
         {
-            var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
-            var fileName = ticket.FileName ?? string.Empty;
-            var filePath = string.IsNullOrWhiteSpace(ticket.FileUrl) ? null : Path.Combine(uploadsDir, fileName);
-            _logger.LogInformation("[ScheduledBatch] filePath={FilePath} fileUrl={FileUrl}", filePath, ticket.FileUrl);
-            if (filePath == null || !File.Exists(filePath)) { ticket.Status = "Error"; await db.SaveChangesAsync(ct); return; }
+            using var storageScope = _sp.CreateScope();
+            var storage = storageScope.ServiceProvider.GetRequiredService<IFileStorageService>();
+            
+            // Usar RelativePath con fallback a estructura legacy
+            string? filePath = null;
+            if (!string.IsNullOrWhiteSpace(ticket.RelativePath))
+            {
+                filePath = storage.GetPhysicalPath(ticket.RelativePath);
+            }
+            else if (!string.IsNullOrWhiteSpace(ticket.FileName))
+            {
+                // Fallback para tickets legacy (estructura antigua)
+                var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+                filePath = Path.Combine(uploadsDir, ticket.FileName);
+            }
+            
+            _logger.LogInformation("[ScheduledBatch] filePath={FilePath} relPath={RelPath}", filePath, ticket.RelativePath);
+            if (filePath == null || !File.Exists(filePath)) 
+            { 
+                ticket.Status = "Error";
+                ticket.LastErrorMessage = "Archivo no encontrado";
+                await db.SaveChangesAsync(ct); 
+                return; 
+            }
 
             byte[] bytes = await File.ReadAllBytesAsync(filePath, ct);
             string mime = GetMimeFromExtension(Path.GetExtension(filePath));
@@ -131,7 +151,9 @@ namespace Gesaicon.Api.Services
                 var body = await resp.Content.ReadAsStringAsync(ct);
                 if (!resp.IsSuccessStatusCode)
                 {
-                    log.Success = false; log.ErrorMessage = $"HTTP {(int)resp.StatusCode}"; ticket.Status = "Error";
+                    log.Success = false; log.ErrorMessage = $"HTTP {(int)resp.StatusCode}"; 
+                    ticket.Status = "Error";
+                    ticket.LastErrorMessage = $"Error HTTP {(int)resp.StatusCode}";
                 }
                 else
                 {
@@ -177,17 +199,35 @@ namespace Gesaicon.Api.Services
                     }
                     else { log.ErrorMessage = "No JSON fragment"; }
 
-                    string? combinedJson = null; try { combinedJson = System.Text.Json.JsonSerializer.Serialize(new { Summary = new { Amount = amount, Company = company, Category = category }, Model = model, FileName = ticket.FileName, Source = "ScheduledBatchAnalysisService" }); } catch {}
+                    string? combinedJson = null; 
+                    try { combinedJson = System.Text.Json.JsonSerializer.Serialize(new { Summary = new { Amount = amount, Company = company, Category = category }, Model = model, FileName = ticket.FileName, Source = "ScheduledBatchAnalysisService" }); } 
+                    catch {}
 
                     string? analysisFileName = null; string? analysisFileUrl = null;
                     if (!string.IsNullOrWhiteSpace(markdownPart))
                     {
-                        var uploads = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
-                        if (!Directory.Exists(uploads)) Directory.CreateDirectory(uploads);
                         analysisFileName = ticket.PublicId + "-analysis.md";
-                        var analysisPath = Path.Combine(uploads, analysisFileName);
+                        
+                        // Guardar en la misma carpeta que el ticket
+                        string analysisPath;
+                        string analysisRelPath;
+                        if (!string.IsNullOrWhiteSpace(ticket.RelativePath))
+                        {
+                            var dir = Path.GetDirectoryName(ticket.RelativePath);
+                            analysisRelPath = Path.Combine(dir!, analysisFileName).Replace('\\', '/');
+                            analysisPath = storage.GetPhysicalPath(analysisRelPath);
+                        }
+                        else
+                        {
+                            // Fallback legacy
+                            var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
+                            analysisPath = Path.Combine(uploadsDir, analysisFileName);
+                            analysisRelPath = analysisFileName;
+                        }
+                        
+                        Directory.CreateDirectory(Path.GetDirectoryName(analysisPath)!);
                         await File.WriteAllTextAsync(analysisPath, markdownPart, System.Text.Encoding.UTF8, ct);
-                        analysisFileUrl = $"/Uploads/{analysisFileName}";
+                        analysisFileUrl = $"/Uploads/{analysisRelPath}";
                     }
 
                     if (amount.HasValue) ticket.Amount = amount;
@@ -198,12 +238,16 @@ namespace Gesaicon.Api.Services
                     ticket.AnalysisFileName = analysisFileName;
                     ticket.AnalysisFileUrl = analysisFileUrl;
                     ticket.Status = log.ErrorMessage == null ? "Completed" : "Error";
+                    if (log.ErrorMessage != null) ticket.LastErrorMessage = log.ErrorMessage;
                     log.Success = log.ErrorMessage == null;
                 }
             }
             catch (Exception ex)
             {
-                log.Success = false; log.ErrorMessage = ex.Message; ticket.Status = "Error"; _logger.LogError(ex, "[ScheduledBatch] Excepcion ticket {Id}", ticket.Id);
+                log.Success = false; log.ErrorMessage = ex.Message; 
+                ticket.Status = "Error"; 
+                ticket.LastErrorMessage = $"Excepción: {ex.Message}";
+                _logger.LogError(ex, "[ScheduledBatch] Excepcion ticket {Id}", ticket.Id);
             }
             finally
             {
