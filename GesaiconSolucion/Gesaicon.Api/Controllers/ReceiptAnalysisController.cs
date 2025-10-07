@@ -8,6 +8,8 @@ using SixLabors.ImageSharp.Processing;
 using Microsoft.EntityFrameworkCore; // agregado para ToListAsync
 using System.Security.Cryptography;
 using Gesaicon.Api.Services; // prompt provider
+using Microsoft.Extensions.DependencyInjection;
+using System.Linq;
 
 namespace Gesaicon.Api.Controllers
 {
@@ -61,13 +63,21 @@ namespace Gesaicon.Api.Controllers
 
             var uploads = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
             if (!Directory.Exists(uploads)) Directory.CreateDirectory(uploads);
-            Guid publicId = Guid.NewGuid();
-            string fileName = publicId + ext;
-            string filePath = Path.Combine(uploads, fileName);
 
-            ExpenseTicket? newTicket = null;
+            Guid publicId;
+            string filePath;
+            string relativeForUrl;
+            string fileName;
+            string? existingRelativePath = null;
+            int? resolvedTicketId = ticketId;
+
             if (!ticketId.HasValue)
             {
+                publicId = Guid.NewGuid();
+                fileName = publicId + ext;
+                filePath = Path.Combine(uploads, fileName);
+                relativeForUrl = fileName;
+
                 using var scope = HttpContext.RequestServices.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<Gesaicon.Api.Data.GesaiconDbContext>();
                 var dup = await db.ExpenseTickets.AsNoTracking().FirstOrDefaultAsync(t => t.FileHash == hash);
@@ -75,8 +85,8 @@ namespace Gesaicon.Api.Controllers
                 {
                     return Conflict(new { duplicateOf = dup.Id, existing = dup });
                 }
-                await System.IO.File.WriteAllBytesAsync(filePath, data);
-                newTicket = new ExpenseTicket
+
+                var newTicket = new ExpenseTicket
                 {
                     PublicId = publicId,
                     FileName = fileName,
@@ -84,18 +94,70 @@ namespace Gesaicon.Api.Controllers
                     FileSizeBytes = data.Length,
                     FileHash = hash,
                     UploadedAt = DateTime.UtcNow,
-                    Status = "Processing"
+                    Status = "Processing",
                 };
                 db.ExpenseTickets.Add(newTicket);
                 await db.SaveChangesAsync();
-                ticketId = newTicket.Id;
+                resolvedTicketId = newTicket.Id;
             }
             else
             {
-                await System.IO.File.WriteAllBytesAsync(filePath, data);
+                using var scope = HttpContext.RequestServices.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService<Gesaicon.Api.Data.GesaiconDbContext>();
+                var info = await db.ExpenseTickets
+                    .AsNoTracking()
+                    .Where(t => t.Id == ticketId.Value)
+                    .Select(t => new { t.Id, t.PublicId, t.FileName, t.RelativePath })
+                    .FirstOrDefaultAsync();
+                if (info == null)
+                {
+                    return NotFound(new { ticketId });
+                }
+
+                publicId = info.PublicId;
+                if (!string.IsNullOrWhiteSpace(info.RelativePath))
+                {
+                    existingRelativePath = info.RelativePath.TrimStart('/', '\').Replace('\', '/');
+                    var normalized = existingRelativePath.Replace('/', Path.DirectorySeparatorChar);
+                    filePath = Path.Combine(uploads, normalized);
+                    var dir = Path.GetDirectoryName(filePath);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+                    fileName = Path.GetFileName(existingRelativePath);
+                    relativeForUrl = existingRelativePath;
+                }
+                else
+                {
+                    fileName = info.FileName ?? (info.PublicId + ext);
+                    filePath = Path.Combine(uploads, fileName);
+                    relativeForUrl = fileName;
+                }
+
+                resolvedTicketId = info.Id;
             }
 
-            var scheme = HttpContext.Request.Scheme; var host = HttpContext.Request.Host.Value; var publicUrl = $"{scheme}://{host}/Uploads/{fileName}";
+            await System.IO.File.WriteAllBytesAsync(filePath, data);
+
+            if (resolvedTicketId.HasValue)
+            {
+                await UpdateTicketAsync(resolvedTicketId.Value, ticket =>
+                {
+                    ticket.FileHash = hash;
+                    ticket.FileSizeBytes = data.Length;
+                    ticket.FileName = Path.GetFileName(relativeForUrl);
+                    ticket.FileUrl = $"/Uploads/{relativeForUrl}";
+                    if (!string.IsNullOrWhiteSpace(existingRelativePath))
+                    {
+                        ticket.RelativePath = existingRelativePath;
+                    }
+                    ticket.Status = "Processing";
+                    ticket.LastErrorMessage = null;
+                });
+            }
+
+            var scheme = HttpContext.Request.Scheme; var host = HttpContext.Request.Host.Value; var publicUrl = $"{scheme}://{host}/Uploads/{relativeForUrl}";
             bool useDataUrl = host.Contains("localhost", StringComparison.OrdinalIgnoreCase);
             string imageReference;
             if (useDataUrl)
@@ -122,18 +184,22 @@ namespace Gesaicon.Api.Controllers
             var endpoint = _config["GROQ:ChatEndpoint"] ?? "https://api.groq.com/openai/v1/chat/completions";
             var payloadJson = JsonSerializer.Serialize(payload);
 
-            var log = new AnalysisLog { TicketId = ticketId, StartedAt = DateTime.UtcNow, Operation = "Single", Attempt = 1, Model = model, Endpoint = endpoint, FileHashSnapshot = hash };
+            var log = new AnalysisLog { TicketId = resolvedTicketId, StartedAt = DateTime.UtcNow, Operation = "Single", Attempt = 1, Model = model, Endpoint = endpoint, FileHashSnapshot = hash };
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             using var httpContent = new StringContent(payloadJson, Encoding.UTF8, "application/json");
             var response = await client.PostAsync(endpoint, httpContent); var body = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
-                log.Success = false; log.ErrorMessage = $"HTTP {(int)response.StatusCode}"; sw.Stop(); log.FinishedAt = DateTime.UtcNow; log.DurationMs = sw.ElapsedMilliseconds; await SaveAnalysisLogAsync(log);
-                if (newTicket != null)
+                var errorMessage = $"HTTP {(int)response.StatusCode}";
+                log.Success = false; log.ErrorMessage = errorMessage; sw.Stop(); log.FinishedAt = DateTime.UtcNow; log.DurationMs = sw.ElapsedMilliseconds; await SaveAnalysisLogAsync(log);
+                if (resolvedTicketId.HasValue)
                 {
-                    using var scopeErr = HttpContext.RequestServices.CreateScope(); var dbErr = scopeErr.ServiceProvider.GetRequiredService<Gesaicon.Api.Data.GesaiconDbContext>();
-                    var t = await dbErr.ExpenseTickets.FindAsync(newTicket.Id); if (t != null) { t.Status = "Error"; await dbErr.SaveChangesAsync(); }
+                    await UpdateTicketAsync(resolvedTicketId.Value, ticket =>
+                    {
+                        ticket.Status = "Error";
+                        ticket.LastErrorMessage = errorMessage;
+                    });
                 }
                 return StatusCode((int)response.StatusCode, new { error = body });
             }
@@ -180,7 +246,7 @@ namespace Gesaicon.Api.Controllers
             }
             else { log.ErrorMessage = "No JSON fragment"; }
 
-            string? combinedJson = null; try { combinedJson = JsonSerializer.Serialize(new { Summary = new { Amount = amount, Company = company, Category = category }, Model = model, FileName = fileName, Source = "ReceiptAnalysisController.Analyze" }); } catch {}
+            string? combinedJson = null; try { combinedJson = JsonSerializer.Serialize(new { Summary = new { Amount = amount, Company = company, Category = category }, Model = model, FileName = relativeForUrl, Source = "ReceiptAnalysisController.Analyze" }); } catch {}
 
             string? analysisFileName = null; string? analysisFileUrl = null;
             if (!string.IsNullOrWhiteSpace(markdownPart))
@@ -189,22 +255,24 @@ namespace Gesaicon.Api.Controllers
                 await System.IO.File.WriteAllTextAsync(analysisPath, markdownPart, Encoding.UTF8); analysisFileUrl = $"/Uploads/{analysisFileName}";
             }
 
-            if (newTicket != null)
+            if (resolvedTicketId.HasValue)
             {
-                using var scopeUpd = HttpContext.RequestServices.CreateScope(); var dbUpd = scopeUpd.ServiceProvider.GetRequiredService<Gesaicon.Api.Data.GesaiconDbContext>();
-                var ticket = await dbUpd.ExpenseTickets.FindAsync(ticketId!.Value);
-                if (ticket != null)
+                await UpdateTicketAsync(resolvedTicketId.Value, ticket =>
                 {
                     if (amount.HasValue) ticket.Amount = amount;
                     if (!string.IsNullOrWhiteSpace(company)) ticket.CompanyName = company;
                     if (!string.IsNullOrWhiteSpace(category)) ticket.Category = category;
-                    ticket.AnalysisJson = combinedJson ?? jsonFragment; ticket.AnalysisMarkdown = markdownPart; ticket.AnalysisFileName = analysisFileName; ticket.AnalysisFileUrl = analysisFileUrl;
-                    ticket.Status = log.ErrorMessage == null ? "Completed" : "Error"; await dbUpd.SaveChangesAsync(); publicId = ticket.PublicId;
-                }
+                    ticket.AnalysisJson = combinedJson ?? jsonFragment;
+                    ticket.AnalysisMarkdown = markdownPart;
+                    ticket.AnalysisFileName = analysisFileName;
+                    ticket.AnalysisFileUrl = analysisFileUrl;
+                    ticket.Status = log.ErrorMessage == null ? "Completed" : "Error";
+                    ticket.LastErrorMessage = log.ErrorMessage;
+                });
             }
 
             log.Success = log.ErrorMessage == null; sw.Stop(); log.FinishedAt = DateTime.UtcNow; log.DurationMs = sw.ElapsedMilliseconds; await SaveAnalysisLogAsync(log);
-            return Ok(new { TicketId = ticketId, PublicId = publicId, Amount = amount, Company = company, Category = category, AnalysisJson = combinedJson ?? jsonFragment, AnalysisMarkdown = markdownPart, AnalysisFileName = analysisFileName, AnalysisFileUrl = analysisFileUrl, Raw = rawText, Model = model });
+            return Ok(new { TicketId = resolvedTicketId, PublicId = publicId, Amount = amount, Company = company, Category = category, AnalysisJson = combinedJson ?? jsonFragment, AnalysisMarkdown = markdownPart, AnalysisFileName = analysisFileName, AnalysisFileUrl = analysisFileUrl, Raw = rawText, Model = model });
         }
 
         private static string? ExtractJson(string text)
@@ -223,7 +291,7 @@ namespace Gesaicon.Api.Controllers
             if (request.File.Length > MaxSizeBytes) return BadRequest("Archivo demasiado grande (max 5MB)");
             var extIn = Path.GetExtension(request.File.FileName); if (!string.IsNullOrEmpty(extIn) && !AllowedExt.Contains(extIn)) return BadRequest("Tipo de archivo no soportado");
 
-            _logger.LogInformation("[AnalyzeAdvanced] Inicio an·lisis avanzado. nombreOriginal={Name} size={Size} stream={Stream} jsonMode={JsonMode}", request.File.FileName, request.File.Length, request.Stream, request.JsonMode);
+            _logger.LogInformation("[AnalyzeAdvanced] Inicio an√°lisis avanzado. nombreOriginal={Name} size={Size} stream={Stream} jsonMode={JsonMode}", request.File.FileName, request.File.Length, request.Stream, request.JsonMode);
             var apiKey = _config["GROQ:ApiKey"]; if (string.IsNullOrWhiteSpace(apiKey)) return StatusCode(500, "GROQ ApiKey no configurada");
 
             var (data, ext, hash) = await ReadAndHashAsync(request.File);
@@ -255,9 +323,9 @@ namespace Gesaicon.Api.Controllers
                 await using var ms2 = new MemoryStream();
                 if (ext.Equals(".png", StringComparison.OrdinalIgnoreCase)) await image2.SaveAsPngAsync(ms2, ct); else await image2.SaveAsJpegAsync(ms2, ct);
                 var b642 = Convert.ToBase64String(ms2.ToArray()); var mime2 = ext.Equals(".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg"; imageReference = $"data:{mime2};base64,{b642}";
-                _logger.LogDebug("[AnalyzeAdvanced] Imagen convertida a base64 tamaÒo={Len} chars", b642.Length);
+                _logger.LogDebug("[AnalyzeAdvanced] Imagen convertida a base64 tama√±o={Len} chars", b642.Length);
             }
-            else { _logger.LogDebug("[AnalyzeAdvanced] Usando URL p˙blica {Url}", publicUrl); imageReference = publicUrl; }
+            else { _logger.LogDebug("[AnalyzeAdvanced] Usando URL p√∫blica {Url}", publicUrl); imageReference = publicUrl; }
 
             var model = request.Model ?? _config["GROQ:VisionModel"] ?? "meta-llama/llama-4-scout-17b-16e-instruct";
             var basePrompt = _promptProvider.GetPrompt(); // reutilizamos el mismo prompt completo
@@ -307,7 +375,7 @@ namespace Gesaicon.Api.Controllers
         [ProducesResponseType(StatusCodes.Status200OK)]
         public async Task<IActionResult> AnalyzePending([FromQuery] int max = 10, [FromQuery] bool includeInProgress = false)
         {
-            _logger.LogInformation("[AnalyzePending] Iniciando an·lisis batch. Max={Max} includeInProgress={IncludeInProgress}", max, includeInProgress);
+            _logger.LogInformation("[AnalyzePending] Iniciando an√°lisis batch. Max={Max} includeInProgress={IncludeInProgress}", max, includeInProgress);
             if (max <= 0) max = 10;
 
             using var scope = HttpContext.RequestServices.CreateScope();
@@ -407,7 +475,17 @@ namespace Gesaicon.Api.Controllers
                 }
                 catch (Exception ex)
                 {
-                    log.Success = false; log.ErrorMessage = ex.Message; _logger.LogError(ex, "[AnalyzePending] ExcepciÛn procesando ticket {Id}", ticket.Id); ticket.Status = "Error"; try { await db.SaveChangesAsync(); } catch { } failed++; results.Add(new { ticket.Id, error = ex.Message });
+        private async Task UpdateTicketAsync(int ticketId, Action<ExpenseTicket> applyChanges)
+        {
+            using var scope = HttpContext.RequestServices.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<Gesaicon.Api.Data.GesaiconDbContext>();
+            var ticket = await db.ExpenseTickets.FirstOrDefaultAsync(t => t.Id == ticketId);
+            if (ticket == null) return;
+            applyChanges(ticket);
+            await db.SaveChangesAsync();
+        }
+
+                    log.Success = false; log.ErrorMessage = ex.Message; _logger.LogError(ex, "[AnalyzePending] Excepci√≥n procesando ticket {Id}", ticket.Id); ticket.Status = "Error"; try { await db.SaveChangesAsync(); } catch { } failed++; results.Add(new { ticket.Id, error = ex.Message });
                 }
                 finally
                 {
@@ -457,14 +535,14 @@ namespace Gesaicon.Api.Controllers
             if (ticket == null) return NotFound();
             if (ticket.Status == "Completed" && !force) return BadRequest("Ya completado");
             ticket.Status = "PendingAnalysis";
-            if (ticket.RetryCount < 3) ticket.RetryCount += 1; // contar el reintento manual tambiÈn
+            if (ticket.RetryCount < 3) ticket.RetryCount += 1; // contar el reintento manual tambi√©n
             await db.SaveChangesAsync();
             if (enqueue)
             {
                 await queue.EnqueueAsync(ticket.Id, ticket.RetryCount);
                 return Ok(new { ticket.Id, ticket.RetryCount, enqueued = true, forced = force });
             }
-            return Ok(new { ticket.Id, ticket.RetryCount, enqueued = false, forced = force, message = "Se reprocesar· por batch" });
+            return Ok(new { ticket.Id, ticket.RetryCount, enqueued = false, forced = force, message = "Se reprocesar√° por batch" });
         }
 
 
@@ -485,7 +563,7 @@ namespace Gesaicon.Api.Controllers
                 await queue.EnqueueAsync(ticket.Id, ticket.RetryCount);
                 return Ok(new { ticket.Id, ticket.PublicId, ticket.RetryCount, enqueued = true });
             }
-            return Ok(new { ticket.Id, ticket.PublicId, ticket.RetryCount, enqueued = false, message = "Se reprocesar· por batch" });
+            return Ok(new { ticket.Id, ticket.PublicId, ticket.RetryCount, enqueued = false, message = "Se reprocesar√° por batch" });
         }
     }
 }
