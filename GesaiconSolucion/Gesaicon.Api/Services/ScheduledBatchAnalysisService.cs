@@ -96,6 +96,8 @@ namespace Gesaicon.Api.Services
         {
             using var storageScope = _sp.CreateScope();
             var storage = storageScope.ServiceProvider.GetRequiredService<IFileStorageService>();
+            var pathStrategy = storageScope.ServiceProvider.GetRequiredService<IBusinessFilePathStrategy>();
+            var env = storageScope.ServiceProvider.GetRequiredService<IHostEnvironment>();
             
             // Usar RelativePath con fallback a estructura legacy
             string? filePath = null;
@@ -181,6 +183,8 @@ namespace Gesaicon.Api.Services
 
                     var jsonExtract = ExtractJson(jsonPart ?? string.Empty);
                     decimal? amount = null; string? company = null; string? category = null;
+                    DateTime? ticketDate = null;
+                    
                     if (jsonExtract != null)
                     {
                         try
@@ -193,15 +197,79 @@ namespace Gesaicon.Api.Services
                             }
                             if (parsed.RootElement.TryGetProperty("Company", out var cEl)) company = cEl.GetString();
                             if (parsed.RootElement.TryGetProperty("Category", out var catEl)) category = catEl.GetString();
+                            
+                            // NUEVO: Extraer fecha del ticket desde el JSON del análisis
+                            string[] dateFields = { "date", "ticketDate", "fecha", "Date", "TicketDate", "Fecha", "transactionDate" };
+                            foreach (var field in dateFields)
+                            {
+                                if (parsed.RootElement.TryGetProperty(field, out var dateEl))
+                                {
+                                    var dateStr = dateEl.GetString();
+                                    if (!string.IsNullOrWhiteSpace(dateStr) && DateTime.TryParse(dateStr, out var parsedDate))
+                                    {
+                                        ticketDate = parsedDate;
+                                        _logger.LogInformation("[ScheduledBatch] Ticket {Id}: fecha extraída del análisis: {Date}", ticket.Id, ticketDate.Value.ToString("yyyy-MM-dd"));
+                                        break;
+                                    }
+                                }
+                            }
+                            
                             log.Amount = amount; log.Company = company; log.Category = category;
                         }
                         catch { log.ErrorMessage = "JSON parse fail"; }
                     }
                     else { log.ErrorMessage = "No JSON fragment"; }
 
+                    if (ticketDate.HasValue)
+                    {
+                        ticket.PurchaseDate = ticketDate.Value;
+                        ticket.ExpenseYear = ticketDate.Value.Year;
+                        ticket.ExpenseMonth = ticketDate.Value.Month;
+                    }
+
                     string? combinedJson = null; 
-                    try { combinedJson = System.Text.Json.JsonSerializer.Serialize(new { Summary = new { Amount = amount, Company = company, Category = category }, Model = model, FileName = ticket.FileName, Source = "ScheduledBatchAnalysisService" }); } 
+                    try 
+                    { 
+                        combinedJson = System.Text.Json.JsonSerializer.Serialize(new 
+                        { 
+                            Summary = new 
+                            { 
+                                Amount = amount, 
+                                Company = company, 
+                                Category = category,
+                                Date = ticketDate?.ToString("yyyy-MM-dd")
+                            }, 
+                            Model = model, 
+                            FileName = ticket.FileName, 
+                            Source = "ScheduledBatchAnalysisService" 
+                        }); 
+                    } 
                     catch {}
+
+                    // Reubicación: SOLO si ya conocemos fecha real (ExpenseYear/Month no nulos) y (a) path está en placeholder 0000/00 o (b) difiere de año/mes actuales
+                    if (ticket.ExpenseYear.HasValue && ticket.ExpenseMonth.HasValue && !string.IsNullOrWhiteSpace(ticket.RelativePath))
+                    {
+                        var currentParts = ticket.RelativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                        bool isPlaceholder = currentParts.Length >= 4 && currentParts[^3] == ticket.ExpenseYear?.ToString("0000") && currentParts[^2] == ticket.ExpenseMonth?.ToString("00") ? false : ticket.RelativePath.Contains("/0000/00/");
+                        // Generar ruta objetivo con pathStrategy
+                        var (dirRel, fileName) = pathStrategy.Generate(ticket.CompanySlug ?? "default", ticket.ExpenseYear.Value, ticket.ExpenseMonth.Value, ticket.PublicId.ToString("N"), ticket.FileName ?? Path.GetFileName(filePath));
+                        var targetRel = Path.Combine(dirRel, fileName).Replace(Path.DirectorySeparatorChar, '/');
+                        if (isPlaceholder || !ticket.RelativePath.Equals(targetRel, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var uploadsRoot = Path.Combine(env.ContentRootPath, "Uploads");
+                            var currentPhysical = storage.GetPhysicalPath(ticket.RelativePath);
+                            var newPhysical = Path.Combine(uploadsRoot, dirRel, fileName);
+                            if (!Directory.Exists(Path.GetDirectoryName(newPhysical)!)) Directory.CreateDirectory(Path.GetDirectoryName(newPhysical)!);
+                            if (!Path.GetFullPath(currentPhysical).Equals(Path.GetFullPath(newPhysical), StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (File.Exists(newPhysical)) File.Delete(newPhysical); // reemplazar (placeholder)
+                                File.Move(currentPhysical, newPhysical);
+                                ticket.RelativePath = targetRel;
+                                ticket.FileUrl = $"/Uploads/{targetRel}";
+                                _logger.LogInformation("[ScheduledBatch] Ticket {Id} movido a ruta definitiva {Path}", ticket.Id, targetRel);
+                            }
+                        }
+                    }
 
                     string? analysisFileName = null; string? analysisFileUrl = null;
                     if (!string.IsNullOrWhiteSpace(markdownPart))
@@ -244,24 +312,13 @@ namespace Gesaicon.Api.Services
             }
             catch (Exception ex)
             {
-                log.Success = false; log.ErrorMessage = ex.Message; 
-                ticket.Status = "Error"; 
-                ticket.LastErrorMessage = $"Excepción: {ex.Message}";
-                _logger.LogError(ex, "[ScheduledBatch] Excepcion ticket {Id}", ticket.Id);
+                log.Success = false; log.ErrorMessage = ex.Message; ticket.Status = "Error"; ticket.LastErrorMessage = $"Excepción: {ex.Message}"; _logger.LogError(ex, "[ScheduledBatch] Excepcion ticket {Id}", ticket.Id);
             }
             finally
             {
                 sw.Stop(); log.FinishedAt = DateTime.UtcNow; log.DurationMs = sw.ElapsedMilliseconds;
-                try
-                {
-                    await db.SaveChangesAsync(ct);
-                    db.AnalysisLogs.Add(log);
-                    await db.SaveChangesAsync(ct);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "[ScheduledBatch] No se pudo guardar AnalysisLog" );
-                }
+                try { await db.SaveChangesAsync(ct); db.AnalysisLogs.Add(log); await db.SaveChangesAsync(ct); }
+                catch (Exception ex) { _logger.LogWarning(ex, "[ScheduledBatch] No se pudo guardar AnalysisLog"); }
             }
         }
 
@@ -284,6 +341,30 @@ namespace Gesaicon.Api.Services
                 if (candidate.StartsWith("{") && candidate.EndsWith("}")) return candidate;
             }
             return null;
+        }
+
+        /// <summary>
+        /// Convierte un nombre de empresa a slug válido para rutas de archivo.
+        /// </summary>
+        private static string ToSlug(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return "unknown";
+
+            text = text.ToLowerInvariant();
+            text = System.Text.RegularExpressions.Regex.Replace(
+                text.Normalize(System.Text.NormalizationForm.FormD),
+                @"[\p{Mn}]",
+                string.Empty
+            );
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"[^a-z0-9\s-]", "");
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
+            text = text.Replace(' ', '-');
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"-+", "-");
+            text = text.Trim('-');
+            if (text.Length > 50)
+                text = text.Substring(0, 50).TrimEnd('-');
+            return string.IsNullOrEmpty(text) ? "unknown" : text;
         }
     }
 }

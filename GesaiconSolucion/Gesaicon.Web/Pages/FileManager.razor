@@ -1,4 +1,5 @@
 @page "/files"
+@using System.Net.Http.Json
 @using Gesaicon.Web.Models
 @inject HttpClient Http
 
@@ -150,6 +151,7 @@ else
                             <th>Ruta / Estructura</th>
                             <th>Empresa</th>
                             <th>Categoría</th>
+                            <th>Fecha Ticket</th>
                             <th class="text-end">Importe</th>
                             <th>Estado</th>
                             <th>Subido</th>
@@ -193,6 +195,22 @@ else
                             </td>
                             <td>@t.CompanyName</td>
                             <td>@t.Category</td>
+                            <td>
+                                @if (t.PurchaseDate.HasValue)
+                                {
+                                    <span class="badge bg-primary">
+                                        <i class="bi bi-calendar-check me-1"></i>
+                                        @t.PurchaseDate.Value.ToString("yyyy-MM-dd")
+                                    </span>
+                                }
+                                else
+                                {
+                                    <span class="text-muted small">
+                                        <i class="bi bi-calendar-x me-1"></i>
+                                        Sin fecha
+                                    </span>
+                                }
+                            </td>
                             <td class="text-end">@((t.Amount)?.ToString("0.00"))</td>
                             <td>
                                 <span class="status-badge @GetStatusClass(t.Status)">
@@ -416,6 +434,24 @@ else
                                         <dt class="col-5 text-muted">Categoría</dt>
                                         <dd class="col-7"><span class="badge bg-secondary">@_selected.Category</span></dd>
                                         
+                                        <dt class="col-5 text-muted">Fecha del Ticket</dt>
+                                        <dd class="col-7">
+                                            @if (_selected.PurchaseDate.HasValue)
+                                            {
+                                                <span class="badge bg-primary fs-6">
+                                                    <i class="bi bi-calendar-check me-1"></i>
+                                                    @_selected.PurchaseDate.Value.ToString("dd/MM/yyyy")
+                                                </span>
+                                            }
+                                            else
+                                            {
+                                                <span class="text-muted">
+                                                    <i class="bi bi-calendar-x me-1"></i>
+                                                    No disponible
+                                                </span>
+                                            }
+                                        </dd>
+                                        
                                         <dt class="col-5 text-muted">Importe</dt>
                                         <dd class="col-7"><strong class="text-success fs-5">@_selected.Amount?.ToString("C")</strong></dd>
                                         
@@ -498,6 +534,50 @@ else
     </div>
 }
 
+<div class="mt-4">
+    <h4>Procesos en segundo plano</h4>
+    <button class="btn btn-sm btn-outline-secondary" @onclick="RefreshBackgroundStatus">Refrescar</button>
+    <span class="ms-2 text-muted">@_bgLastRefreshed</span>
+    <div class="mt-2">
+        @if (_bgLoading)
+        {
+            <em>Cargando...</em>
+        }
+        else if (_bgStatuses?.Count == 0)
+        {
+            <em>Sin datos</em>
+        }
+        else if (_bgStatuses != null)
+        {
+            <table class="table table-sm table-striped align-middle">
+                <thead>
+                    <tr>
+                        <th>Servicio</th>
+                        <th>Estado</th>
+                        <th>Última Actualización (UTC)</th>
+                        <th>Procesados</th>
+                        <th>Errores</th>
+                        <th>Activo</th>
+                    </tr>
+                </thead>
+                <tbody>
+                @foreach (var s in _bgStatuses)
+                {
+                    <tr class="@(s.Running ? "" : "table-secondary")">
+                        <td>@s.ServiceName</td>
+                        <td>@s.LastMessage</td>
+                        <td>@s.LastUpdateUtc.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        <td>@s.Processed</td>
+                        <td class="@(s.Errors>0?"text-danger fw-bold":"")">@s.Errors</td>
+                        <td>@(s.Running?"Sí":"No")</td>
+                    </tr>
+                }
+                </tbody>
+            </table>
+        }
+    </div>
+</div>
+
 @code {
     private List<ExpenseTicketDto> _tickets = new();
     private ExpenseTicketDto? _selected;
@@ -520,9 +600,14 @@ else
     private HashSet<int> _migratingIds = new();
     private HashSet<int> _fixingSlugIds = new();
 
+    private List<BgStatusDto>? _bgStatuses;
+    private bool _bgLoading;
+    private string? _bgLastRefreshed;
+
     protected override async Task OnInitializedAsync()
     {
         await LoadAsync();
+        await RefreshBackgroundStatus();
     }
 
     private string GetStatusClass(string status) => status switch
@@ -823,5 +908,36 @@ else
         html = html.Replace("\r", "");
         html = string.Join("", html.Split('\n').Select(l => l.StartsWith("<h") ? l : ($"<p>{l}</p>")));
         return html;
+    }
+
+    private async Task RefreshBackgroundStatus()
+    {
+        try
+        {
+            _bgLoading = true; 
+            StateHasChanged();
+            var data = await Http.GetFromJsonAsync<List<BgStatusDto>>("api/diagnostics/background-status");
+            _bgStatuses = data ?? new();
+            _bgLastRefreshed = DateTime.UtcNow.ToString("HH:mm:ss");
+        }
+        catch (Exception ex)
+        {
+            _bgStatuses = new List<BgStatusDto>{ new BgStatusDto{ ServiceName="ERROR", LastMessage=ex.Message, Running=false } };
+        }
+        finally
+        {
+            _bgLoading = false; 
+            StateHasChanged();
+        }
+    }
+
+    public class BgStatusDto
+    {
+        public string ServiceName { get; set; } = string.Empty;
+        public string LastMessage { get; set; } = string.Empty;
+        public DateTime LastUpdateUtc { get; set; }
+        public int Processed { get; set; }
+        public int Errors { get; set; }
+        public bool Running { get; set; }
     }
 }

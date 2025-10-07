@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using Gesaicon.Api.Diagnostics;
 
 namespace Gesaicon.Api.Tests.Services
 {
@@ -52,7 +53,8 @@ namespace Gesaicon.Api.Tests.Services
                 _serviceProvider,
                 _mockEnv.Object,
                 options,
-                _mockQueue.Object);
+                _mockQueue.Object,
+                new BackgroundStatusStore());
 
             // Assert
             service.Should().NotBeNull();
@@ -107,7 +109,8 @@ namespace Gesaicon.Api.Tests.Services
                 _serviceProvider,
                 _mockEnv.Object,
                 options,
-                _mockQueue.Object);
+                _mockQueue.Object,
+                new BackgroundStatusStore());
 
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
 
@@ -151,6 +154,41 @@ namespace Gesaicon.Api.Tests.Services
             options.BackupFolder.Should().NotBeNullOrEmpty();
             options.ProcessedFolder.Should().NotBeNullOrEmpty();
             options.ErrorFolder.Should().NotBeNullOrEmpty();
+        }
+
+        [Fact]
+        public void ExpenseTicket_ShouldHavePurchaseDateField()
+        {
+            // Arrange & Act
+            var ticket = new ExpenseTicket
+            {
+                Id = 1,
+                PublicId = Guid.NewGuid(),
+                PurchaseDate = new DateTime(2025, 10, 6),
+                ExpenseYear = 2025,
+                ExpenseMonth = 10
+            };
+
+            // Assert
+            ticket.PurchaseDate.Should().NotBeNull();
+            ticket.PurchaseDate.Value.Year.Should().Be(2025);
+            ticket.PurchaseDate.Value.Month.Should().Be(10);
+            ticket.PurchaseDate.Value.Day.Should().Be(6);
+        }
+
+        [Fact]
+        public void ExpenseTicket_PurchaseDateCanBeNull()
+        {
+            // Arrange & Act
+            var ticket = new ExpenseTicket
+            {
+                Id = 1,
+                PublicId = Guid.NewGuid(),
+                PurchaseDate = null
+            };
+
+            // Assert
+            ticket.PurchaseDate.Should().BeNull();
         }
 
         public void Dispose()

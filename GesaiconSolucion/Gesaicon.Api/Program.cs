@@ -7,6 +7,7 @@ using Microsoft.Extensions.FileProviders;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
 using Gesaicon.Api.Services;
+using Gesaicon.Api.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -17,6 +18,8 @@ Log.Logger = new LoggerConfiguration()
     .CreateLogger();
 
 builder.Host.UseSerilog();
+
+builder.Services.AddSingleton<BackgroundStatusStore>();
 
 // Rate Limiting policy (10 req/min por IP para endpoints protegidos)
 builder.Services.AddRateLimiter(options =>
@@ -113,10 +116,8 @@ builder.Services.AddSingleton<ReceiptAnalysisQueueService>();
 builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>());
 builder.Services.AddSingleton<IReceiptAnalysisQueue>(sp => sp.GetRequiredService<ReceiptAnalysisQueueService>()); // corregido
 
+// Scheduled batch analysis service
 builder.Services.AddHostedService<ScheduledBatchAnalysisService>();
-
-// Corrección automática de tickets legacy al arranque
-builder.Services.AddHostedService<LegacyTicketFixService>();
 
 // File ingestion options + hosted service
 builder.Services.Configure<FileIngestionOptions>(builder.Configuration.GetSection("FileIngestion"));
@@ -124,6 +125,12 @@ if (builder.Configuration.GetSection("FileIngestion").GetValue<bool>("Enabled"))
 {
     builder.Services.AddHostedService<FolderIngestionService>();
 }
+
+// Legacy fix DESPUÉS de la ingesta para que encuentre tickets placeholder
+//builder.Services.AddHostedService<LegacyTicketFixService>();
+
+// Servicio de reparación de rutas - ejecuta una vez al inicio
+//builder.Services.AddHostedService<TicketPathRepairService>();
 
 var app = builder.Build();
 

@@ -4,6 +4,7 @@ using Gesaicon.Api.Models;
 using Gesaicon.Api.Services.Storage;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using Gesaicon.Api.Diagnostics; // agregado
 
 namespace Gesaicon.Api.Services;
 
@@ -19,11 +20,7 @@ public class FileIngestionOptions
     public int MaxPerScan { get; set; } = 25;
     public bool EnqueueForAnalysis { get; set; } = true;
     public string[] AllowedExtensions { get; set; } = new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp" };
-    
-    // NUEVO: valor por defecto para ingesta automática
-    public string DefaultCompanySlug { get; set; } = "default";
-    
-    // NUEVO: Forzar reprocesamiento de todos los tickets (incluso los que ya están correctos)
+    public string DefaultCompanySlug { get; set; } = "default"; // temporal
     public bool ForceReprocessAll { get; set; } = false;
 }
 
@@ -34,19 +31,22 @@ public class FolderIngestionService : BackgroundService
     private readonly IHostEnvironment _env;
     private readonly FileIngestionOptions _opt;
     private readonly IReceiptAnalysisQueue _queue;
+    private readonly BackgroundStatusStore _status;
 
     public FolderIngestionService(
         ILogger<FolderIngestionService> logger,
         IServiceProvider sp,
         IHostEnvironment env,
         IOptions<FileIngestionOptions> opt,
-        IReceiptAnalysisQueue queue)
+        IReceiptAnalysisQueue queue,
+        BackgroundStatusStore status)
     {
         _logger = logger;
         _sp = sp;
         _env = env;
         _opt = opt.Value;
         _queue = queue;
+        _status = status;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -54,10 +54,12 @@ public class FolderIngestionService : BackgroundService
         if (!_opt.Enabled)
         {
             _logger.LogInformation("[Ingestion] Deshabilitado por configuración");
+            _status.Update("FolderIngestion", "Deshabilitado", running: false);
             return;
         }
 
         _logger.LogInformation("[Ingestion] Iniciando servicio. Carpeta origen={Source}", _opt.SourceFolder);
+        _status.Update("FolderIngestion", "Iniciado");
         EnsureFolders();
 
         while (!stoppingToken.IsCancellationRequested)
@@ -70,12 +72,14 @@ public class FolderIngestionService : BackgroundService
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Ingestion] Error general del ciclo");
+                _status.Update("FolderIngestion", "Error ciclo: " + ex.Message, errorDelta: 1);
             }
 
             var delay = TimeSpan.FromSeconds(Math.Max(3, _opt.ScanIntervalSeconds));
             await Task.Delay(delay, stoppingToken);
         }
         _logger.LogInformation("[Ingestion] Servicio detenido");
+        _status.Update("FolderIngestion", "Detenido", running: false);
     }
 
     private void EnsureFolders()
@@ -113,6 +117,7 @@ public class FolderIngestionService : BackgroundService
         if (!candidates.Any()) return;
 
         _logger.LogInformation("[Ingestion] {Count} archivo(s) candidato(s) para procesar", candidates.Count);
+        _status.Update("FolderIngestion", $"Procesando {candidates.Count} archivo(s)..." );
 
         foreach (var filePath in candidates)
         {
@@ -125,6 +130,7 @@ public class FolderIngestionService : BackgroundService
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Ingestion] Error procesando {File}", Path.GetFileName(filePath));
+                _status.Update("FolderIngestion", $"Error archivo {Path.GetFileName(filePath)}", errorDelta:1);
                 MoveToError(filePath, "error");
             }
         }
@@ -179,9 +185,10 @@ public class FolderIngestionService : BackgroundService
         }
 
         var publicId = Guid.NewGuid();
-        var now = DateTime.UtcNow;
         
-        // Usar nueva estructura de storage
+        // NO usar fecha de subida. Siempre guardar en carpeta placeholder 0000/00 hasta conocer fecha real.
+        const int placeholderYear = 0; // se serializa como 0000
+        const int placeholderMonth = 0; // 00
         var storage = scope.ServiceProvider.GetRequiredService<IFileStorageService>();
         StoredFileInfo stored;
         
@@ -190,8 +197,8 @@ public class FolderIngestionService : BackgroundService
             stored = await storage.SaveTicketFileAsync(
                 ms,
                 _opt.DefaultCompanySlug,
-                now.Year,
-                now.Month,
+                placeholderYear,
+                placeholderMonth,
                 publicId.ToString("N"),
                 fileName,
                 ct);
@@ -201,8 +208,8 @@ public class FolderIngestionService : BackgroundService
         {
             PublicId = publicId,
             CompanySlug = _opt.DefaultCompanySlug,
-            ExpenseYear = now.Year,
-            ExpenseMonth = now.Month,
+            ExpenseYear = null,          // NO asignar fecha de subida
+            ExpenseMonth = null,
             FileName = stored.OriginalFileName,
             RelativePath = stored.RelativePath,
             FileUrl = $"/Uploads/{stored.RelativePath}",
@@ -218,13 +225,14 @@ public class FolderIngestionService : BackgroundService
         if (_opt.EnqueueForAnalysis)
         {
             await _queue.EnqueueAsync(ticket.Id, 0);
-            _logger.LogInformation("[Ingestion] Ticket {Id} encolado para análisis", ticket.Id);
+            _logger.LogInformation("[Ingestion] Ticket {Id} encolado (ruta temporal empresas/default/0000/00/ hasta conocer fecha real)", ticket.Id);
         }
         else
         {
             _logger.LogInformation("[Ingestion] Ticket {Id} creado sin encolar (config)", ticket.Id);
         }
 
+        _status.Update("FolderIngestion", $"Ticket {ticket.Id} creado", processedDelta:1);
         MoveToProcessed(originalPath, processedDir, "OK");
     }
 

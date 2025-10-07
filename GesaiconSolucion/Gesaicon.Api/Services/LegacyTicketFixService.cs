@@ -2,341 +2,349 @@ using Gesaicon.Api.Data;
 using Gesaicon.Api.Services.Storage;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using Gesaicon.Api.Diagnostics;
+using System.Text.RegularExpressions;
 
 namespace Gesaicon.Api.Services;
 
 /// <summary>
-/// Servicio que automáticamente corrige tickets legacy al iniciar la aplicación.
-/// Se ejecuta una sola vez al arranque y migra/corrige tickets sin RelativePath o con empresa incorrecta.
+/// Reprocesa / migra tickets legacy siguiendo el guion indicado por el usuario.
+/// Pasos:
+/// 1) Recorre TODOS los registros de la tabla ExpenseTickets
+/// 2) Comprueba la ruta donde el registro dice que está (RelativePath / FileName)
+/// 3) Si no lo encuentra intenta localizarlo recursivamente en Uploads
+/// 4) Una vez encontrado obtiene la fecha (JSON -> Markdown -> archivo MD -> ExpenseYear/Month). Si NO tiene fecha lo deja en default (carpeta 0000/00)
+/// 5) Mueve el archivo a destino usando primero una copia temporal (rollback seguro) y luego elimina el original. Igual para el .md
+/// 6) Comprueba que la ruta registrada en DB coincide con la ubicación física del archivo (y del markdown si existe)
 /// </summary>
-public class LegacyTicketFixService : IHostedService
+public sealed class LegacyTicketFixService : BackgroundService
 {
     private readonly ILogger<LegacyTicketFixService> _logger;
     private readonly IServiceProvider _sp;
     private readonly IHostEnvironment _env;
     private readonly string _defaultCompanySlug;
-    private readonly bool _forceReprocessAll;
+    private readonly bool _forceReprocessAll; // ya no se usa para filtrar, pero mantenemos compatibilidad config
+    private readonly BackgroundStatusStore _status;
+
+    private const int WarmupSeconds = 2;
+    private const string TempDirName = "__legacyfix_tmp";
 
     public LegacyTicketFixService(
         ILogger<LegacyTicketFixService> logger,
         IServiceProvider sp,
         IHostEnvironment env,
-        IOptions<FileIngestionOptions> options)
+        IOptions<FileIngestionOptions> ingestionOptions,
+        BackgroundStatusStore status)
     {
         _logger = logger;
         _sp = sp;
         _env = env;
-        _defaultCompanySlug = options.Value.DefaultCompanySlug;
-        _forceReprocessAll = options.Value.ForceReprocessAll;
+        _defaultCompanySlug = ingestionOptions.Value.DefaultCompanySlug;
+        _forceReprocessAll = ingestionOptions.Value.ForceReprocessAll;
+        _status = status;
     }
 
-    public async Task StartAsync(CancellationToken cancellationToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // No ejecutar en ambiente de testing
         if (_env.EnvironmentName.Equals("Testing", StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogInformation("[LegacyFix] Saltando corrección automática en ambiente Testing");
+            _status.Update("LegacyFix", "Saltado (Testing)", running: false);
             return;
         }
 
-        try
-        {
-            await FixLegacyTicketsAsync(cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "[LegacyFix] Error durante la corrección automática de tickets legacy");
-        }
-
-        return;
+        _status.Update("LegacyFix", "Iniciando", running: true);
+        _logger.LogInformation("[LegacyFix] Iniciando reproceso (ForceReprocessAll={Force})", _forceReprocessAll);
+        try { await Task.Delay(TimeSpan.FromSeconds(WarmupSeconds), stoppingToken); } catch { }
+        await RunAsync(stoppingToken);
+        _status.Update("LegacyFix", "Finalizado", running: false);
+        _logger.LogInformation("[LegacyFix] Finalizado");
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
-    {
-        return Task.CompletedTask;
-    }
-
-    private async Task FixLegacyTicketsAsync(CancellationToken ct)
+    private async Task RunAsync(CancellationToken ct)
     {
         using var scope = _sp.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<GesaiconDbContext>();
-        var strategy = scope.ServiceProvider.GetRequiredService<IBusinessFilePathStrategy>();
-
+        var pathStrategy = scope.ServiceProvider.GetRequiredService<IBusinessFilePathStrategy>();
         var uploadsRoot = Path.Combine(_env.ContentRootPath, "Uploads");
+        Directory.CreateDirectory(uploadsRoot);
+        var tempRoot = Path.Combine(uploadsRoot, TempDirName);
+        Directory.CreateDirectory(tempRoot);
 
-        // Determinar qué tickets procesar según configuración
-        IQueryable<Models.ExpenseTicket> query = db.ExpenseTickets;
-        
-        if (_forceReprocessAll)
+        var tickets = await db.ExpenseTickets.AsNoTracking().ToListAsync(ct);
+        if (tickets.Count == 0) { _logger.LogInformation("[LegacyFix] 0 tickets"); return; }
+
+        // Index único de todos los archivos para búsqueda recursiva
+        var allFiles = Directory.EnumerateFiles(uploadsRoot, "*", SearchOption.AllDirectories)
+            .Where(p => !p.Contains(Path.DirectorySeparatorChar + TempDirName + Path.DirectorySeparatorChar))
+            .ToList();
+        _logger.LogInformation("[LegacyFix] Indexados {Count} archivos físicos", allFiles.Count);
+
+        int processed = 0, moved = 0, skipped = 0, errors = 0, missing = 0, noDate = 0, verifiedOk = 0;
+
+        foreach (var snapshot in tickets)
         {
-            // Modo FORZADO: Reprocesar TODOS los tickets (útil para corregir migraciones fallidas)
-            _logger.LogWarning("[LegacyFix] MODO FORZADO ACTIVADO: reprocesando TODOS los tickets");
-            // No aplicar filtro, tomar todos
-        }
-        else
-        {
-            // Modo NORMAL: Solo tickets que necesitan corrección
-            // 1. Sin RelativePath (legacy puro) 
-            // 2. Con CompanySlug null o "default" (necesita inferirse desde CompanyName)
-            query = query.Where(t => t.RelativePath == null || t.RelativePath == "" || 
-                                    t.CompanySlug == null || t.CompanySlug == "default");
-        }
-        
-        var ticketsToFix = await query.ToListAsync(ct);
-
-        if (!ticketsToFix.Any())
-        {
-            _logger.LogInformation("[LegacyFix] No hay tickets que procesar");
-            return;
-        }
-
-        _logger.LogInformation("[LegacyFix] Iniciando corrección de {Count} tickets (ForceReprocessAll={Force})", 
-            ticketsToFix.Count, _forceReprocessAll);
-
-        int corrected = 0, errors = 0, skipped = 0;
-
-        foreach (var ticket in ticketsToFix)
-        {
+            if (ct.IsCancellationRequested) break;
+            processed++;
+            _status.Update("LegacyFix", $"Ticket {snapshot.Id}", processedDelta: 1);
             try
             {
-                // IMPORTANTE: Extraer fecha REAL del ticket desde AnalysisJson si existe
-                int year;
-                int month;
-                
-                if (TryExtractDateFromAnalysis(ticket.AnalysisJson, out var ticketDate))
+                // 2+3: localizar archivo principal
+                var located = LocateFile(snapshot, uploadsRoot, allFiles);
+                if (located == null)
                 {
-                    year = ticketDate.Year;
-                    month = ticketDate.Month;
-                    _logger.LogDebug("[LegacyFix] Ticket {Id}: fecha extraída del análisis {Date}", 
-                        ticket.Id, ticketDate.ToString("yyyy-MM-dd"));
-                }
-                else
-                {
-                    // Fallback: usar ExpenseYear/Month si existen, sino UploadedAt
-                    year = ticket.ExpenseYear ?? ticket.UploadedAt.Year;
-                    month = ticket.ExpenseMonth ?? ticket.UploadedAt.Month;
-                    _logger.LogDebug("[LegacyFix] Ticket {Id}: usando fecha de BD/Upload {Year}-{Month:D2}", 
-                        ticket.Id, year, month);
-                }
-
-                // IMPORTANTE: Usar CompanyName de la BD si existe, sino usar default
-                string companySlug;
-                if (!string.IsNullOrWhiteSpace(ticket.CompanyName))
-                {
-                    // Convertir CompanyName a slug (lowercase, sin espacios, sin caracteres especiales)
-                    companySlug = ToSlug(ticket.CompanyName);
-                    _logger.LogDebug("[LegacyFix] Ticket {Id}: usando empresa de BD '{Company}' -> slug '{Slug}'", 
-                        ticket.Id, ticket.CompanyName, companySlug);
-                }
-                else
-                {
-                    companySlug = _defaultCompanySlug;
-                    _logger.LogWarning("[LegacyFix] Ticket {Id}: sin empresa en BD, usando default '{Slug}'", 
-                        ticket.Id, companySlug);
-                }
-
-                // Determinar ruta del archivo actual
-                string? currentPath = null;
-                if (!string.IsNullOrWhiteSpace(ticket.RelativePath))
-                {
-                    // Ticket ya migrado parcialmente
-                    currentPath = Path.Combine(uploadsRoot, ticket.RelativePath.Replace('/', Path.DirectorySeparatorChar));
-                }
-                else if (!string.IsNullOrWhiteSpace(ticket.FileName))
-                {
-                    // Ticket legacy puro
-                    currentPath = Path.Combine(uploadsRoot, ticket.FileName);
-                }
-
-                if (currentPath == null || !File.Exists(currentPath))
-                {
-                    _logger.LogWarning("[LegacyFix] Ticket {Id}: archivo no encontrado en {Path}", ticket.Id, currentPath);
-                    skipped++;
+                    missing++;
+                    _logger.LogWarning("[LegacyFix] Ticket {Id}: archivo no encontrado. RelativePath={Rel} FileName={File}", snapshot.Id, snapshot.RelativePath, snapshot.FileName);
                     continue;
                 }
+                var (currentPhys, originalFileName, currentRel) = located.Value;
 
-                var ticketId = ticket.PublicId.ToString("N");
-                var originalFileName = ticket.FileName ?? Path.GetFileName(currentPath);
-                
-                // Generar ruta nueva usando companySlug, year y month correctos
-                var (dirRel, fileName) = strategy.Generate(companySlug, year, month, ticketId, originalFileName);
-                var newRelativePath = Path.Combine(dirRel, fileName).Replace(Path.DirectorySeparatorChar, '/');
-                var newPhysicalPath = Path.Combine(uploadsRoot, dirRel, fileName);
-
-                // Si ya está en la ubicación correcta, solo actualizar BD
-                if (Path.GetFullPath(currentPath).Equals(Path.GetFullPath(newPhysicalPath), StringComparison.OrdinalIgnoreCase))
+                // 4: fecha real
+                var (date, dateOrigin) = ExtractRealDate(snapshot, uploadsRoot);
+                bool hasDate = date.HasValue;
+                if (!hasDate)
                 {
-                    var needsUpdate = ticket.CompanySlug != companySlug ||
-                                     ticket.ExpenseYear != year ||
-                                     ticket.ExpenseMonth != month ||
-                                     ticket.RelativePath != newRelativePath;
-
-                    if (needsUpdate)
-                    {
-                        ticket.CompanySlug = companySlug;
-                        ticket.ExpenseYear = year;
-                        ticket.ExpenseMonth = month;
-                        ticket.RelativePath = newRelativePath;
-                        ticket.FileUrl = $"/Uploads/{newRelativePath}";
-                        corrected++;
-                        _logger.LogDebug("[LegacyFix] Ticket {Id}: BD actualizada sin mover archivo", ticket.Id);
-                    }
-                    else
-                    {
-                        skipped++;
-                    }
-                    continue;
+                    noDate++;
+                    // carpeta default/0000/00
                 }
 
-                // Mover archivo físicamente
-                Directory.CreateDirectory(Path.GetDirectoryName(newPhysicalPath)!);
-                
-                // Protección contra duplicados
-                if (File.Exists(newPhysicalPath))
+                // Determinar destino
+                var companySlug = hasDate && !string.IsNullOrWhiteSpace(snapshot.CompanyName)
+                    ? ToSlug(snapshot.CompanyName!)
+                    : _defaultCompanySlug; // sin fecha -> default
+
+                int year = hasDate ? date!.Value.Year : 0;
+                int month = hasDate ? date!.Value.Month : 0;
+
+                // Cargar entidad trackeada para actualizar
+                var ticket = await db.ExpenseTickets.FirstAsync(t => t.Id == snapshot.Id, ct);
+                var ticketIdStr = ticket.PublicId.ToString("N");
+
+                var (targetDirRel, targetFileName) = pathStrategy.Generate(companySlug, year, month, ticketIdStr, originalFileName);
+                var targetPhysDir = Path.Combine(uploadsRoot, targetDirRel);
+                var targetPhys = Path.Combine(targetPhysDir, targetFileName);
+                var targetRel = Path.Combine(targetDirRel, targetFileName).Replace(Path.DirectorySeparatorChar, '/');
+
+                bool alreadyRightPlace = Path.GetFullPath(currentPhys) == Path.GetFullPath(targetPhys);
+
+                if (!alreadyRightPlace)
                 {
-                    var uniqueName = $"{ticketId}_{DateTime.UtcNow:yyyyMMddHHmmss}{Path.GetExtension(fileName)}";
-                    fileName = uniqueName;
-                    newRelativePath = Path.Combine(dirRel, fileName).Replace(Path.DirectorySeparatorChar, '/');
-                    newPhysicalPath = Path.Combine(uploadsRoot, dirRel, fileName);
+                    Directory.CreateDirectory(targetPhysDir);
+
+                    // 5: mover usando temp
+                    var tempName = ticketIdStr + "-tmp-" + Guid.NewGuid().ToString("N") + Path.GetExtension(currentPhys);
+                    var tempPhys = Path.Combine(tempRoot, tempName);
+                    try
+                    {
+                        File.Copy(currentPhys, tempPhys, overwrite: true);
+                        File.Move(tempPhys, targetPhys, overwrite: true);
+                        if (File.Exists(currentPhys)) File.Delete(currentPhys);
+                    }
+                    catch (Exception moveEx)
+                    {
+                        _logger.LogError(moveEx, "[LegacyFix] Ticket {Id}: error moviendo archivo principal", ticket.Id);
+                        if (File.Exists(tempPhys)) { try { File.Delete(tempPhys); } catch { } }
+                        errors++; continue;
+                    }
                 }
 
-                File.Move(currentPath, newPhysicalPath, overwrite: false);
-
-                // Actualizar ticket
-                ticket.CompanySlug = companySlug;
-                ticket.ExpenseYear = year;
-                ticket.ExpenseMonth = month;
-                ticket.RelativePath = newRelativePath;
-                ticket.FileUrl = $"/Uploads/{newRelativePath}";
-
-                // Migrar archivo de análisis si existe
-                if (!string.IsNullOrWhiteSpace(ticket.AnalysisFileName))
+                // Mover markdown asociado si existe
+                if (!string.IsNullOrWhiteSpace(ticket.AnalysisFileUrl) && !string.IsNullOrWhiteSpace(ticket.AnalysisFileName))
                 {
-                    string? oldAnalysisPath = null;
-                    
-                    if (!string.IsNullOrWhiteSpace(ticket.AnalysisFileUrl))
+                    try
                     {
-                        var relPath = ticket.AnalysisFileUrl.Replace("/Uploads/", "").Replace('/', Path.DirectorySeparatorChar);
-                        oldAnalysisPath = Path.Combine(uploadsRoot, relPath);
-                    }
-                    else
-                    {
-                        oldAnalysisPath = Path.Combine(uploadsRoot, ticket.AnalysisFileName);
-                    }
-
-                    if (File.Exists(oldAnalysisPath))
-                    {
-                        var newAnalysisRelPath = Path.Combine(dirRel, ticket.AnalysisFileName).Replace(Path.DirectorySeparatorChar, '/');
-                        var newAnalysisPath = Path.Combine(uploadsRoot, dirRel, ticket.AnalysisFileName);
-                        
-                        if (!Path.GetFullPath(oldAnalysisPath).Equals(Path.GetFullPath(newAnalysisPath), StringComparison.OrdinalIgnoreCase))
+                        var oldMdRel = ticket.AnalysisFileUrl.Replace("/Uploads/", "");
+                        var oldMdPhys = Path.Combine(uploadsRoot, oldMdRel.Replace('/', Path.DirectorySeparatorChar));
+                        if (File.Exists(oldMdPhys))
                         {
-                            File.Move(oldAnalysisPath, newAnalysisPath, overwrite: false);
-                            ticket.AnalysisFileUrl = $"/Uploads/{newAnalysisRelPath}";
+                            var newMdRel = Path.Combine(targetDirRel, ticket.AnalysisFileName).Replace(Path.DirectorySeparatorChar, '/');
+                            var newMdPhys = Path.Combine(uploadsRoot, newMdRel.Replace('/', Path.DirectorySeparatorChar));
+                            if (Path.GetFullPath(newMdPhys) != Path.GetFullPath(oldMdPhys))
+                            {
+                                Directory.CreateDirectory(Path.GetDirectoryName(newMdPhys)!);
+                                var tempMd = Path.Combine(tempRoot, ticketIdStr + "-mdtmp-" + Guid.NewGuid().ToString("N") + Path.GetExtension(oldMdPhys));
+                                File.Copy(oldMdPhys, tempMd, overwrite: true);
+                                File.Move(tempMd, newMdPhys, overwrite: true);
+                                if (File.Exists(oldMdPhys)) File.Delete(oldMdPhys);
+                                ticket.AnalysisFileUrl = $"/Uploads/{newMdRel}";
+                            }
                         }
                     }
+                    catch (Exception mdEx)
+                    {
+                        _logger.LogError(mdEx, "[LegacyFix] Ticket {Id}: error moviendo markdown", ticket.Id);
+                    }
                 }
 
-                corrected++;
-                _logger.LogInformation("[LegacyFix] Ticket {Id} ({Company}) ? empresas/{Slug}/{Year:D4}/{Month:D2}/", 
-                    ticket.Id, ticket.CompanyName ?? "sin empresa", companySlug, year, month);
+                // 6: actualizar registro + verificación
+                ticket.CompanySlug = companySlug;
+                ticket.ExpenseYear = hasDate ? year : null;
+                ticket.ExpenseMonth = hasDate ? month : null;
+                ticket.RelativePath = targetRel;
+                ticket.FileUrl = $"/Uploads/{targetRel}";
+                ticket.FileName ??= originalFileName;
+                await db.SaveChangesAsync(ct);
+
+                bool fileOk = File.Exists(targetPhys);
+                bool mdOk = true;
+                if (!string.IsNullOrWhiteSpace(ticket.AnalysisFileUrl))
+                {
+                    var mdRel = ticket.AnalysisFileUrl.Replace("/Uploads/", "");
+                    var mdPhys = Path.Combine(uploadsRoot, mdRel.Replace('/', Path.DirectorySeparatorChar));
+                    mdOk = File.Exists(mdPhys);
+                }
+
+                if (fileOk && mdOk)
+                {
+                    moved += alreadyRightPlace ? 0 : 1;
+                    verifiedOk++;
+                    _logger.LogInformation("[LegacyFix] Ticket {Id} OK -> {Rel} origenFecha={Origen} fecha={Fecha}", ticket.Id, ticket.RelativePath, dateOrigin, hasDate ? date!.Value.ToString("yyyy-MM-dd") : "(sin)");
+                }
+                else
+                {
+                    errors++;
+                    _logger.LogError("[LegacyFix] Ticket {Id} verificación fallida (fileOk={FileOk} mdOk={MdOk})", ticket.Id, fileOk, mdOk);
+                }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[LegacyFix] Error corrigiendo ticket {Id}", ticket.Id);
                 errors++;
+                _logger.LogError(ex, "[LegacyFix] Ticket {Id}: error general", snapshot.Id);
             }
         }
 
-        if (corrected > 0)
-        {
-            await db.SaveChangesAsync(ct);
-            _logger.LogInformation("[LegacyFix] Corrección completada: {Corrected} corregidos, {Skipped} omitidos, {Errors} errores", 
-                corrected, skipped, errors);
-        }
-        else
-        {
-            _logger.LogInformation("[LegacyFix] No se realizaron cambios");
-        }
+        _logger.LogInformation("[LegacyFix] Resumen: Total={Total} Movidos={Movidos} SinFecha(->default)={NoDate} NoEncontrado={Missing} Skip={Skip} OK={Ok} Errores={Errors}", tickets.Count, moved, noDate, missing, skipped, verifiedOk, errors);
+        _status.Update("LegacyFix", $"Fin mov={moved} sinFecha={noDate} missing={missing} err={errors}", running: false);
     }
 
-    /// <summary>
-    /// Convierte un nombre de empresa a slug válido para rutas de archivo.
-    /// Ejemplos: "McDonald's" -> "mcdonalds", "E.Leclerc" -> "eleclerc", "Lidl Supermercados S.A.U" -> "lidl-supermercados-sau"
-    /// </summary>
+    private static (string physicalPath, string originalFileName, string? currentRel)? LocateFile(Models.ExpenseTicket t, string uploadsRoot, List<string> allFiles)
+    {
+        // a) RelativePath exacta
+        if (!string.IsNullOrWhiteSpace(t.RelativePath))
+        {
+            var phys = Path.Combine(uploadsRoot, t.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(phys)) return (phys, t.FileName ?? Path.GetFileName(phys), t.RelativePath);
+        }
+        // b) FileName en cualquier carpeta
+        if (!string.IsNullOrWhiteSpace(t.FileName))
+        {
+            var fn = t.FileName;
+            var match = allFiles.FirstOrDefault(p => Path.GetFileName(p).Equals(fn, StringComparison.OrdinalIgnoreCase));
+            if (match != null) return (match, fn, null);
+        }
+        // c) GUID sin guiones
+        var guidN = t.PublicId.ToString("N");
+        var matchGuid = allFiles.FirstOrDefault(p => Path.GetFileName(p).StartsWith(guidN, StringComparison.OrdinalIgnoreCase) && !p.EndsWith("-analysis.md", StringComparison.OrdinalIgnoreCase));
+        if (matchGuid != null) return (matchGuid, Path.GetFileName(matchGuid), null);
+        // d) GUID con guiones contenido
+        var guidHyphen = t.PublicId.ToString();
+        var matchGuidH = allFiles.FirstOrDefault(p => Path.GetFileNameWithoutExtension(p).Contains(guidHyphen, StringComparison.OrdinalIgnoreCase) && !p.EndsWith("-analysis.md", StringComparison.OrdinalIgnoreCase));
+        if (matchGuidH != null) return (matchGuidH, Path.GetFileName(matchGuidH), null);
+        return null;
+    }
+
+    private static (DateTime? date, string origin) ExtractRealDate(Models.ExpenseTicket t, string uploadsRoot)
+    {
+        if (TryExtractDateFromAnalysis(t.AnalysisJson, out var dJson)) return (dJson, "json");
+        if (!string.IsNullOrWhiteSpace(t.AnalysisMarkdown) && TryExtractDateFromMarkdown(t.AnalysisMarkdown!, out var dMd)) return (dMd, "markdown-inline");
+        if (!string.IsNullOrWhiteSpace(t.AnalysisFileUrl))
+        {
+            var rel = t.AnalysisFileUrl.Replace("/Uploads/", "");
+            var phys = Path.Combine(uploadsRoot, rel.Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(phys))
+            {
+                try { var txt = File.ReadAllText(phys); if (TryExtractDateFromMarkdown(txt, out var dMd2)) return (dMd2, "markdown-file"); } catch { }
+            }
+        }
+        if (t.ExpenseYear.HasValue && t.ExpenseMonth.HasValue)
+        {
+            try { return (new DateTime(t.ExpenseYear.Value, t.ExpenseMonth.Value, 1), "stored"); } catch { }
+        }
+        return (null, "none");
+    }
+
     private static string ToSlug(string text)
     {
-        if (string.IsNullOrWhiteSpace(text))
-            return "unknown";
-
-        // Lowercase
+        if (string.IsNullOrWhiteSpace(text)) return "unknown";
         text = text.ToLowerInvariant();
-
-        // Remover acentos
-        text = System.Text.RegularExpressions.Regex.Replace(
-            text.Normalize(System.Text.NormalizationForm.FormD),
-            @"[\p{Mn}]",
-            string.Empty
-        );
-
-        // Reemplazar caracteres no alfanuméricos por guiones
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"[^a-z0-9\s-]", "");
-
-        // Reemplazar espacios múltiples por uno solo
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
-
-        // Reemplazar espacios por guiones
+        text = Regex.Replace(text.Normalize(System.Text.NormalizationForm.FormD), "[\\p{Mn}]", string.Empty);
+        text = Regex.Replace(text, "[^a-z0-9\\s-]", "");
+        text = Regex.Replace(text, "\\s+", " ").Trim();
         text = text.Replace(' ', '-');
-
-        // Remover guiones múltiples
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"-+", "-");
-
-        // Remover guiones al inicio y final
+        text = Regex.Replace(text, "-+", "-");
         text = text.Trim('-');
-
-        // Limitar longitud
-        if (text.Length > 50)
-            text = text.Substring(0, 50).TrimEnd('-');
-
+        if (text.Length > 50) text = text[..50].TrimEnd('-');
         return string.IsNullOrEmpty(text) ? "unknown" : text;
     }
 
-    /// <summary>
-    /// Intenta extraer la fecha real del ticket desde el AnalysisJson.
-    /// Busca campos como "date", "ticketDate", "fecha", etc.
-    /// </summary>
     private static bool TryExtractDateFromAnalysis(string? analysisJson, out DateTime ticketDate)
     {
         ticketDate = DateTime.MinValue;
-        
-        if (string.IsNullOrWhiteSpace(analysisJson))
-            return false;
-
+        if (string.IsNullOrWhiteSpace(analysisJson)) return false;
         try
         {
             using var doc = System.Text.Json.JsonDocument.Parse(analysisJson);
-            var root = doc.RootElement;
-
-            // Buscar campos de fecha comunes
-            string[] dateFields = { "date", "ticketDate", "fecha", "Date", "TicketDate", "Fecha", "transactionDate" };
-            
-            foreach (var field in dateFields)
+            var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "date", "ticketDate", "fecha", "transactionDate" };
+            DateTime? foundDate = null;
+            bool Walk(System.Text.Json.JsonElement el)
             {
-                if (root.TryGetProperty(field, out var dateElement))
+                switch (el.ValueKind)
                 {
-                    var dateStr = dateElement.GetString();
-                    if (!string.IsNullOrWhiteSpace(dateStr) && DateTime.TryParse(dateStr, out ticketDate))
-                    {
-                        return true;
-                    }
+                    case System.Text.Json.JsonValueKind.Object:
+                        foreach (var prop in el.EnumerateObject())
+                        {
+                            if (wanted.Contains(prop.Name))
+                            {
+                                var s = prop.Value.GetString();
+                                if (!string.IsNullOrWhiteSpace(s) && TryParseFlexible(s, out var parsed)) { foundDate = parsed; return true; }
+                            }
+                            if (Walk(prop.Value)) return true;
+                        }
+                        break;
+                    case System.Text.Json.JsonValueKind.Array:
+                        foreach (var item in el.EnumerateArray()) if (Walk(item)) return true; break;
                 }
+                return false;
             }
+            if (Walk(doc.RootElement) && foundDate.HasValue) { ticketDate = foundDate.Value; return true; }
         }
-        catch
-        {
-            // Si falla el parsing, continuar con el fallback
-        }
+        catch { }
+        return false;
+    }
 
+    private static bool TryExtractDateFromMarkdown(string markdown, out DateTime date)
+    {
+        date = DateTime.MinValue;
+        if (string.IsNullOrWhiteSpace(markdown)) return false;
+        var patterns = new[] { @"\\b\\d{4}-\\d{2}-\\d{2}\\b", @"\\b\\d{1,2}/\\d{1,2}/\\d{4}\\b", @"\\b\\d{1,2}-\\d{1,2}-\\d{4}\\b" };
+        foreach (var p in patterns)
+        {
+            var m = Regex.Match(markdown, p);
+            if (m.Success && TryParseFlexible(m.Value, out var parsed)) { date = parsed; return true; }
+        }
+        var meses = "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre";
+        var rxLargo = new Regex(@$"\\b(\\d{{1,2}}) ({{{meses}}}) (\\d{{4}})\\b", RegexOptions.IgnoreCase);
+        var m2 = rxLargo.Match(markdown);
+        if (m2.Success)
+        {
+            try
+            {
+                var day = int.Parse(m2.Groups[1].Value);
+                var monthName = m2.Groups[2].Value.ToLowerInvariant();
+                var year = int.Parse(m2.Groups[3].Value);
+                var month = Array.IndexOf(new[]{"enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"}, monthName) + 1;
+                if (month > 0) { date = new DateTime(year, month, day); return true; }
+            }
+            catch { }
+        }
+        return false;
+    }
+
+    private static bool TryParseFlexible(string input, out DateTime dt)
+    {
+        string[] formats = {"yyyy-MM-dd","dd/MM/yyyy","d/M/yyyy","dd-MM-yyyy","d-M-yyyy","yyyy/MM/dd","yyyy.M.d","dd.MM.yyyy","d.MM.yyyy"};
+        if (DateTime.TryParse(input, out dt)) return true;
+        foreach (var f in formats)
+            if (DateTime.TryParseExact(input, f, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out dt)) return true;
         return false;
     }
 }

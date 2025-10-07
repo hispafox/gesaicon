@@ -6,6 +6,7 @@ public record ExpenseTicketDto(
     string? CompanySlug,
     int? ExpenseYear,
     int? ExpenseMonth,
+    DateTime? PurchaseDate,
     string? FileName,
     string? FileUrl,
     string? RelativePath,

@@ -4,6 +4,7 @@ using Gesaicon.Api.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -11,9 +12,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace Gesaicon.Api.Migrations
 {
     [DbContext(typeof(GesaiconDbContext))]
-    partial class GesaiconDbContextModelSnapshot : ModelSnapshot
+    [Migration("20251007172014_AddPurchaseDateField")]
+    partial class AddPurchaseDateField
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

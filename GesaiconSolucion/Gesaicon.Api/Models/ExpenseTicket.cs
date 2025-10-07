@@ -12,6 +12,11 @@ namespace Gesaicon.Api.Models
         public int? ExpenseYear { get; set; }
         public int? ExpenseMonth { get; set; }
         
+        /// <summary>
+        /// Fecha real del ticket extraída del análisis. Esta es la fecha de referencia.
+        /// </summary>
+        public DateTime? PurchaseDate { get; set; }
+        
         public string? FileName { get; set; }
         public string? FileUrl { get; set; }
         public string? RelativePath { get; set; } // NUEVO: guarda la ruta relativa completa desde Uploads
